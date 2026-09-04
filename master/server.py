@@ -1,11 +1,34 @@
-"""Minimal TCP master server for Phase 1: accepts one worker, exchanges a PING/ACK."""
+"""TCP master server: accepts a worker connection and serves RPC requests over it."""
 
 import socket
 
+from master import rpc_handler
+from rpc import protocol
 from rpc.connection import Connection
+from rpc.protocol import ProtocolError, build_message
 
 HOST = "127.0.0.1"
 PORT = 5000
+
+
+def serve_connection(conn: Connection) -> None:
+    while True:
+        try:
+            raw = conn.recv_bytes()
+        except ConnectionError:
+            break
+
+        try:
+            request = protocol.decode_message(raw)
+        except ProtocolError as exc:
+            error = build_message(protocol.ERROR, "unknown", {"code": "INVALID_MESSAGE", "message": str(exc)})
+            conn.send_bytes(protocol.encode_message(error))
+            continue
+
+        print(f"RPC received: {request['type']}")
+        response = rpc_handler.handle_request(request)
+        print(f"RPC response: {response['type']}")
+        conn.send_bytes(protocol.encode_message(response))
 
 
 def main():
@@ -20,12 +43,7 @@ def main():
     conn = Connection(client_sock)
 
     try:
-        message = conn.recv_bytes()
-        print(f"Received: {message.decode()}")
-
-        response = b"ACK"
-        conn.send_bytes(response)
-        print(f"Sent: {response.decode()}")
+        serve_connection(conn)
     finally:
         conn.close()
         server_sock.close()
