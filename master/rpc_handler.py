@@ -1,11 +1,10 @@
 """Processes incoming RPC requests and produces RPC responses."""
 
-from common.models import Worker
+from master.worker_manager import DuplicateWorkerError, WorkerManager
 from rpc import protocol
 from rpc.protocol import build_message
 
-# In-memory worker registry: worker_id -> Worker
-registered_workers: dict[str, Worker] = {}
+worker_manager = WorkerManager()
 
 
 def handle_ping(request: dict) -> dict:
@@ -18,10 +17,13 @@ def handle_register(request: dict) -> dict:
     host = payload.get("host")
     port = payload.get("port")
 
-    if not worker_id or not host or not port:
-        return build_error(request["request_id"], "INVALID_PAYLOAD", "worker_id, host, and port are required")
+    try:
+        worker_manager.register_worker(worker_id, host, port)
+    except DuplicateWorkerError:
+        return build_error(request["request_id"], "DUPLICATE_WORKER", "Worker already registered")
+    except ValueError as exc:
+        return build_error(request["request_id"], "INVALID_PAYLOAD", str(exc))
 
-    registered_workers[worker_id] = Worker(worker_id=worker_id, host=host, port=port)
     print(f"Worker registered: {worker_id}")
 
     return build_message(
