@@ -50,6 +50,23 @@ class Scheduler:
     def get_all_tasks(self) -> list[Task]:
         return list(self._tasks.values())
 
+    def assign_next_pending_task(self) -> Task | None:
+        """Assign the oldest PENDING task to an IDLE worker, if both exist.
+
+        Returns the assigned task, or None if there is no pending task or
+        no idle worker is currently available (the task stays PENDING).
+        """
+        for task in self._tasks.values():
+            if task.status != TaskStatus.PENDING:
+                continue
+
+            try:
+                return self.assign_task(task.task_id)
+            except NoAvailableWorkerError:
+                return None
+
+        return None
+
     def assign_task(self, task_id: str) -> Task:
         task = self._tasks.get(task_id)
 
@@ -129,3 +146,6 @@ class Scheduler:
             raise TaskNotFoundError(f"Unknown task: {task_id}")
 
         return task
+
+    def clear(self) -> None:
+        self._tasks.clear()

@@ -11,6 +11,14 @@ class WorkerNotFoundError(KeyError):
     """Raised when looking up a worker_id that isn't registered."""
 
 
+VALID_WORKER_STATUSES = {
+    WorkerStatus.REGISTERED,
+    WorkerStatus.IDLE,
+    WorkerStatus.BUSY,
+    WorkerStatus.FAILED,
+}
+
+
 class WorkerManager:
     def __init__(self):
         self._workers: dict[str, Worker] = {}
@@ -40,6 +48,9 @@ class WorkerManager:
         return list(self._workers.values())
 
     def update_status(self, worker_id: str, status: str) -> Worker:
+        if status not in VALID_WORKER_STATUSES:
+            raise ValueError(f"Invalid worker status: {status}")
+
         worker = self._workers.get(worker_id)
         if worker is None:
             raise WorkerNotFoundError(f"Unknown worker: {worker_id}")
@@ -50,3 +61,6 @@ class WorkerManager:
         if worker_id not in self._workers:
             raise WorkerNotFoundError(f"Unknown worker: {worker_id}")
         del self._workers[worker_id]
+
+    def clear(self) -> None:
+        self._workers.clear()

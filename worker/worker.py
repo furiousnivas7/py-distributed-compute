@@ -30,11 +30,11 @@ def send_rpc(conn: Connection, msg_type: str, payload: dict | None = None) -> di
     return response
 
 
-def register(conn: Connection) -> dict:
+def register(conn: Connection, worker_id: str, worker_host: str, worker_port: int) -> dict:
     return send_rpc(
         conn,
         protocol.REGISTER,
-        {"worker_id": WORKER_ID, "host": WORKER_HOST, "port": WORKER_PORT},
+        {"worker_id": worker_id, "host": worker_host, "port": worker_port},
     )
 
 
@@ -65,7 +65,13 @@ def serve_tasks(conn: Connection) -> None:
         print(f"Sent RPC: {protocol.TASK_RESULT}")
 
 
-def run_worker(master_host: str, master_port: int) -> None:
+def run_worker(
+    master_host: str,
+    master_port: int,
+    worker_id: str = WORKER_ID,
+    worker_host: str = WORKER_HOST,
+    worker_port: int = WORKER_PORT,
+) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((master_host, master_port))
     print("Connected to master")
@@ -75,7 +81,7 @@ def run_worker(master_host: str, master_port: int) -> None:
         ping_response = send_rpc(conn, protocol.PING)
         print(f"Status: {ping_response['payload'].get('status')}")
 
-        register_response = register(conn)
+        register_response = register(conn, worker_id, worker_host, worker_port)
         print(f"Status: {register_response['payload'].get('status')}")
 
         serve_tasks(conn)

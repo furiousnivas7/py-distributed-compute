@@ -52,6 +52,12 @@ def test_update_status_missing_worker_raises(manager):
         manager.update_status("missing", WorkerStatus.BUSY)
 
 
+def test_update_status_invalid_status_raises(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    with pytest.raises(ValueError):
+        manager.update_status("worker-1", "NOT_A_REAL_STATUS")
+
+
 def test_remove_worker(manager):
     manager.register_worker("worker-1", "127.0.0.1", 6001)
     manager.remove_worker("worker-1")
