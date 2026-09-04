@@ -24,6 +24,7 @@ class Worker:
     host: str
     port: int
     status: str = WorkerStatus.REGISTERED
+    last_heartbeat: float | None = None
 
 
 @dataclass

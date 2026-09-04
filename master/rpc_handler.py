@@ -1,6 +1,6 @@
 """Processes incoming RPC requests and produces RPC responses."""
 
-from master.worker_manager import DuplicateWorkerError, WorkerManager
+from master.worker_manager import DuplicateWorkerError, WorkerManager, WorkerNotFoundError
 from rpc import protocol
 from rpc.protocol import build_message
 
@@ -33,6 +33,18 @@ def handle_register(request: dict) -> dict:
     )
 
 
+def handle_heartbeat(request: dict) -> dict:
+    payload = request["payload"]
+    worker_id = payload.get("worker_id")
+
+    try:
+        worker_manager.record_heartbeat(worker_id)
+    except WorkerNotFoundError:
+        return build_error(request["request_id"], "UNKNOWN_WORKER", f"Unknown worker: {worker_id}")
+
+    return build_message(protocol.HEARTBEAT_ACK, request["request_id"], {"status": "success"})
+
+
 def build_error(request_id: str, code: str, message: str) -> dict:
     return build_message(protocol.ERROR, request_id, {"code": code, "message": message})
 
@@ -40,6 +52,7 @@ def build_error(request_id: str, code: str, message: str) -> dict:
 HANDLERS = {
     protocol.PING: handle_ping,
     protocol.REGISTER: handle_register,
+    protocol.HEARTBEAT: handle_heartbeat,
 }
 
 

@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from common.models import WorkerStatus
@@ -15,6 +17,7 @@ def test_register_new_worker(manager):
     assert worker.host == "127.0.0.1"
     assert worker.port == 6001
     assert worker.status == WorkerStatus.IDLE
+    assert worker.last_heartbeat is not None
 
 
 def test_get_worker(manager):
@@ -56,6 +59,22 @@ def test_update_status_invalid_status_raises(manager):
     manager.register_worker("worker-1", "127.0.0.1", 6001)
     with pytest.raises(ValueError):
         manager.update_status("worker-1", "NOT_A_REAL_STATUS")
+
+
+def test_record_heartbeat_updates_timestamp(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    first_heartbeat = manager.get_worker("worker-1").last_heartbeat
+
+    time.sleep(0.01)
+    manager.record_heartbeat("worker-1")
+
+    second_heartbeat = manager.get_worker("worker-1").last_heartbeat
+    assert second_heartbeat > first_heartbeat
+
+
+def test_record_heartbeat_missing_worker_raises(manager):
+    with pytest.raises(WorkerNotFoundError):
+        manager.record_heartbeat("missing")
 
 
 def test_remove_worker(manager):

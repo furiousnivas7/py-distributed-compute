@@ -1,5 +1,7 @@
 """In-memory registry of workers known to the master."""
 
+import time
+
 from common.models import Worker, WorkerStatus
 
 
@@ -37,7 +39,13 @@ class WorkerManager:
         if self.has_worker(worker_id):
             raise DuplicateWorkerError(f"Worker already registered: {worker_id}")
 
-        worker = Worker(worker_id=worker_id, host=host, port=port, status=WorkerStatus.IDLE)
+        worker = Worker(
+            worker_id=worker_id,
+            host=host,
+            port=port,
+            status=WorkerStatus.IDLE,
+            last_heartbeat=time.time(),
+        )
         self._workers[worker_id] = worker
         return worker
 
@@ -55,6 +63,13 @@ class WorkerManager:
         if worker is None:
             raise WorkerNotFoundError(f"Unknown worker: {worker_id}")
         worker.status = status
+        return worker
+
+    def record_heartbeat(self, worker_id: str) -> Worker:
+        worker = self._workers.get(worker_id)
+        if worker is None:
+            raise WorkerNotFoundError(f"Unknown worker: {worker_id}")
+        worker.last_heartbeat = time.time()
         return worker
 
     def remove_worker(self, worker_id: str) -> None:

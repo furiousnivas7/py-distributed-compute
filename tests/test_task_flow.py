@@ -327,3 +327,91 @@ def test_dispatch_concurrently_is_faster_than_sequential():
         server_sock.close()
         for thread in worker_threads:
             thread.join(timeout=2)
+
+
+def test_heartbeat_round_trip_over_real_tcp():
+    """A HEARTBEAT is sent on its own short-lived connection (not the
+    long-lived task-dispatch one) and updates the worker's last_heartbeat."""
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+
+    worker_thread = threading.Thread(target=worker.run_worker, args=("127.0.0.1", port), daemon=True)
+    worker_thread.start()
+
+    conn, worker_id = master_server.accept_and_register(server_sock)
+
+    try:
+        before = master_server.worker_manager.get_worker(worker_id).last_heartbeat
+
+        heartbeat_thread = threading.Thread(
+            target=worker.send_heartbeat, args=("127.0.0.1", port, worker_id), daemon=True
+        )
+        heartbeat_thread.start()
+
+        request, response = master_server.accept_and_handle_one(server_sock)
+        heartbeat_thread.join(timeout=2)
+
+        assert request["type"] == protocol.HEARTBEAT
+        assert request["payload"] == {"worker_id": worker_id}
+        assert response["type"] == protocol.HEARTBEAT_ACK
+        assert response["payload"]["status"] == "success"
+
+        after = master_server.worker_manager.get_worker(worker_id).last_heartbeat
+        assert after >= before
+    finally:
+        conn.close()
+        server_sock.close()
+        worker_thread.join(timeout=2)
+
+
+def test_heartbeat_for_unknown_worker_is_rejected():
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+
+    heartbeat_thread = threading.Thread(
+        target=worker.send_heartbeat, args=("127.0.0.1", port, "ghost-worker"), daemon=True
+    )
+    heartbeat_thread.start()
+
+    try:
+        request, response = master_server.accept_and_handle_one(server_sock)
+        heartbeat_thread.join(timeout=2)
+
+        assert request["type"] == protocol.HEARTBEAT
+        assert response["type"] == protocol.ERROR
+        assert response["payload"]["code"] == "UNKNOWN_WORKER"
+    finally:
+        server_sock.close()
+
+
+def test_heartbeat_loop_sends_periodically():
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+
+    worker_thread = threading.Thread(target=worker.run_worker, args=("127.0.0.1", port), daemon=True)
+    worker_thread.start()
+    conn, worker_id = master_server.accept_and_register(server_sock)
+
+    stop_event = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=worker.start_heartbeat_loop,
+        args=("127.0.0.1", port, worker_id, stop_event),
+        kwargs={"interval": 0.05},
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
+    try:
+        seen = 0
+        deadline = time.monotonic() + 2
+        while seen < 3 and time.monotonic() < deadline:
+            master_server.accept_and_handle_one(server_sock)
+            seen += 1
+
+        assert seen == 3
+        assert master_server.worker_manager.get_worker(worker_id).last_heartbeat is not None
+    finally:
+        stop_event.set()
+        conn.close()
+        server_sock.close()
+        worker_thread.join(timeout=2)
