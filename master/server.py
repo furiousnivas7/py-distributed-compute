@@ -53,6 +53,26 @@ def accept_and_register(server_sock: socket.socket) -> tuple[Connection, str]:
             return conn, request["payload"]["worker_id"]
 
 
+def accept_and_handle_one(server_sock: socket.socket) -> tuple[dict, dict]:
+    """Accept a connection, handle exactly one request on it, then close it.
+
+    Used for short-lived, single-purpose connections such as a HEARTBEAT
+    ping — kept separate from the long-lived per-worker connection so a
+    worker's periodic heartbeats can never race with the master reading a
+    TASK_RESULT on that other connection.
+    """
+    client_sock, addr = server_sock.accept()
+    conn = Connection(client_sock)
+
+    try:
+        request = protocol.decode_message(conn.recv_bytes())
+        response = rpc_handler.handle_request(request)
+        conn.send_bytes(protocol.encode_message(response))
+        return request, response
+    finally:
+        conn.close()
+
+
 def dispatch_task(conn: Connection, task_id: str, task_type: str, task_payload: dict) -> dict:
     """Send a TASK request to a worker and return its decoded TASK_RESULT response."""
     request = build_message(
