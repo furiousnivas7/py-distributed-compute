@@ -1,6 +1,7 @@
 """TCP master server: registers workers, then schedules and dispatches tasks to them."""
 
 import socket
+import threading
 
 from master import rpc_handler
 from master.scheduler import Scheduler
@@ -14,6 +15,14 @@ EXPECTED_WORKERS = 2
 
 worker_manager = rpc_handler.worker_manager
 scheduler = Scheduler(worker_manager)
+
+# Dispatching multiple tasks concurrently (Phase 6.3) runs one thread per
+# in-flight task. The network I/O (send/recv on each worker's own socket)
+# is safe to run in parallel, but the Scheduler/WorkerManager dicts are
+# shared mutable state, so every state transition is serialized through
+# this lock. Only the blocking network call happens outside it — that's
+# what lets two workers actually run at the same time.
+_state_lock = threading.Lock()
 
 
 def accept_and_register(server_sock: socket.socket) -> tuple[Connection, str]:
@@ -64,24 +73,51 @@ def dispatch_assigned_task(connections: dict[str, Connection], task) -> dict:
 
     `connections` maps worker_id -> Connection, since the scheduler only knows
     which worker_id a task was assigned to, not how to reach it over the network.
+    Safe to call from multiple threads at once, each with a different task:
+    the network call runs unlocked (so workers genuinely run concurrently),
+    and only the surrounding scheduler state changes are locked.
     """
     conn = connections[task.assigned_worker_id]
 
-    scheduler.start_task(task.task_id)
+    with _state_lock:
+        scheduler.start_task(task.task_id)
+
     response = dispatch_task(conn, task.task_id, task.task_type, task.payload)
 
     if response["type"] != protocol.TASK_RESULT:
-        scheduler.fail_task(task.task_id)
+        with _state_lock:
+            scheduler.fail_task(task.task_id)
         return response
 
     result = response["payload"]
 
-    if result["status"] == "success":
-        scheduler.complete_task(task.task_id)
-    else:
-        scheduler.fail_task(task.task_id)
+    with _state_lock:
+        if result["status"] == "success":
+            scheduler.complete_task(task.task_id)
+        else:
+            scheduler.fail_task(task.task_id)
 
     return response
+
+
+def dispatch_concurrently(connections: dict[str, Connection], tasks: list) -> list[dict]:
+    """Dispatch several already-ASSIGNED tasks to their workers in parallel.
+
+    Each task runs on its own thread so the master isn't blocked waiting on
+    worker 1's TASK_RESULT before it can even send worker 2 its task.
+    """
+    responses: list[dict | None] = [None] * len(tasks)
+
+    def run(index: int, task) -> None:
+        responses[index] = dispatch_assigned_task(connections, task)
+
+    threads = [threading.Thread(target=run, args=(i, task)) for i, task in enumerate(tasks)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    return responses
 
 
 def submit_and_dispatch_task(
@@ -91,9 +127,9 @@ def submit_and_dispatch_task(
     task_payload: dict,
 ) -> dict:
     """Submit a task and, if a worker is free right now, assign and dispatch it."""
-    scheduler.submit_task(task_id, task_type, task_payload)
-
-    task = scheduler.assign_next_pending_task()
+    with _state_lock:
+        scheduler.submit_task(task_id, task_type, task_payload)
+        task = scheduler.assign_next_pending_task()
 
     if task is None:
         return {"status": "pending", "task_id": task_id}
@@ -105,26 +141,24 @@ def drain_pending_tasks(connections: dict[str, Connection]) -> list[dict]:
     """Repeatedly assign and dispatch PENDING tasks to IDLE workers until none remain.
 
     Each round assigns one task per currently-IDLE worker (a pure in-memory
-    step, no network I/O) before dispatching any of them. Dispatching blocks
-    until a TASK_RESULT comes back, so assigning a whole round up front is
-    what lets multiple idle workers each get a task instead of whichever
-    worker finishes first grabbing every task in the queue.
+    step, no network I/O), then dispatches that whole round concurrently —
+    one thread per task — instead of waiting for each worker in turn.
     """
     responses = []
 
     while True:
         batch = []
-        while True:
-            task = scheduler.assign_next_pending_task()
-            if task is None:
-                break
-            batch.append(task)
+        with _state_lock:
+            while True:
+                task = scheduler.assign_next_pending_task()
+                if task is None:
+                    break
+                batch.append(task)
 
         if not batch:
             break
 
-        for task in batch:
-            responses.append(dispatch_assigned_task(connections, task))
+        responses.extend(dispatch_concurrently(connections, batch))
 
     return responses
 

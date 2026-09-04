@@ -1,11 +1,14 @@
 import socket
 import threading
+import time
 
 import pytest
 
 from master import rpc_handler, server as master_server
 from rpc import protocol
+from rpc.connection import Connection
 from worker import worker
+from worker.executor import execute_task
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +29,44 @@ def start_server_socket() -> socket.socket:
     server_sock.bind(("127.0.0.1", 0))
     server_sock.listen(1)
     return server_sock
+
+
+def run_gated_worker(host: str, port: int, worker_id: str, ready_event: threading.Event, release_event: threading.Event) -> None:
+    """Like worker.run_worker, but pauses right before executing a TASK until
+    `release_event` is set, and signals `ready_event` once it's paused there.
+    Lets a test observe a task mid-flight (status RUNNING) deterministically,
+    without relying on sleep-based timing."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    conn = Connection(sock)
+
+    try:
+        worker.send_rpc(conn, protocol.PING)
+        worker.register(conn, worker_id, "127.0.0.1", 6000)
+
+        while True:
+            try:
+                raw = conn.recv_bytes()
+            except ConnectionError:
+                return
+
+            request = protocol.decode_message(raw)
+            if request["type"] != protocol.TASK:
+                continue
+
+            task_payload = request["payload"]
+            ready_event.set()
+            release_event.wait(timeout=5)
+
+            result = execute_task(task_payload["task_type"], task_payload["task_payload"])
+            response = protocol.build_message(
+                protocol.TASK_RESULT,
+                request["request_id"],
+                {"task_id": task_payload["task_id"], **result},
+            )
+            conn.send_bytes(protocol.encode_message(response))
+    finally:
+        conn.close()
 
 
 def test_task_dispatched_and_executed_over_real_tcp():
@@ -159,6 +200,127 @@ def test_scheduler_queues_tasks_across_two_workers():
         }
         for w in master_server.worker_manager.get_all_workers():
             assert w.status == "IDLE"
+    finally:
+        for conn in connections.values():
+            conn.close()
+        server_sock.close()
+        for thread in worker_threads:
+            thread.join(timeout=2)
+
+
+def test_dispatch_concurrently_runs_both_tasks_at_once():
+    """Deterministic proof of concurrency: both tasks reach RUNNING and sit
+    there simultaneously, gated on events rather than sleeps/timing."""
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+
+    ready = {"worker-1": threading.Event(), "worker-2": threading.Event()}
+    release = {"worker-1": threading.Event(), "worker-2": threading.Event()}
+
+    worker_threads = [
+        threading.Thread(
+            target=run_gated_worker,
+            args=("127.0.0.1", port, worker_id, ready[worker_id], release[worker_id]),
+            daemon=True,
+        )
+        for worker_id in ("worker-1", "worker-2")
+    ]
+    for thread in worker_threads:
+        thread.start()
+
+    connections = {}
+
+    try:
+        for _ in range(2):
+            conn, worker_id = master_server.accept_and_register(server_sock)
+            connections[worker_id] = conn
+
+        master_server.scheduler.submit_task("task-1", "ADD", {"a": 1, "b": 1})
+        master_server.scheduler.submit_task("task-2", "ADD", {"a": 2, "b": 2})
+
+        task1 = master_server.scheduler.assign_next_pending_task()
+        task2 = master_server.scheduler.assign_next_pending_task()
+
+        dispatch_thread = threading.Thread(
+            target=master_server.dispatch_concurrently, args=(connections, [task1, task2])
+        )
+        dispatch_thread.start()
+
+        assert ready["worker-1"].wait(timeout=5)
+        assert ready["worker-2"].wait(timeout=5)
+
+        # Both workers are now paused mid-task -> both tasks must be RUNNING
+        # at the same time, which is only possible if dispatch didn't block
+        # on worker-1 before ever contacting worker-2.
+        assert master_server.scheduler.get_task("task-1").status == "RUNNING"
+        assert master_server.scheduler.get_task("task-2").status == "RUNNING"
+
+        release["worker-1"].set()
+        release["worker-2"].set()
+        dispatch_thread.join(timeout=5)
+
+        assert master_server.scheduler.get_task("task-1").status == "COMPLETED"
+        assert master_server.scheduler.get_task("task-2").status == "COMPLETED"
+        for w in master_server.worker_manager.get_all_workers():
+            assert w.status == "IDLE"
+    finally:
+        for conn in connections.values():
+            conn.close()
+        server_sock.close()
+        for thread in worker_threads:
+            thread.join(timeout=2)
+
+
+def test_dispatch_concurrently_is_faster_than_sequential():
+    """Sanity check: two workers that each take DELAY seconds finish in
+    roughly DELAY seconds total when dispatched concurrently, not 2x DELAY."""
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+    DELAY = 0.3
+
+    worker_threads = [
+        threading.Thread(target=worker.run_worker, args=("127.0.0.1", port), kwargs={"worker_id": wid}, daemon=True)
+        for wid in ("worker-1", "worker-2")
+    ]
+    for thread in worker_threads:
+        thread.start()
+
+    connections = {}
+
+    try:
+        for _ in range(2):
+            conn, worker_id = master_server.accept_and_register(server_sock)
+            connections[worker_id] = conn
+
+        # SLEEP isn't a real task type; ADD/MULTIPLY execute effectively
+        # instantly, so the delay has to come from the worker side instead —
+        # monkeypatch execute_task briefly to simulate slow work.
+        import worker.worker as worker_module
+
+        original_execute = worker_module.execute_task
+
+        def slow_execute(task_type, payload):
+            time.sleep(DELAY)
+            return original_execute(task_type, payload)
+
+        worker_module.execute_task = slow_execute
+        try:
+            master_server.scheduler.submit_task("task-1", "ADD", {"a": 1, "b": 1})
+            master_server.scheduler.submit_task("task-2", "ADD", {"a": 2, "b": 2})
+
+            task1 = master_server.scheduler.assign_next_pending_task()
+            task2 = master_server.scheduler.assign_next_pending_task()
+
+            start = time.monotonic()
+            responses = master_server.dispatch_concurrently(connections, [task1, task2])
+            elapsed = time.monotonic() - start
+        finally:
+            worker_module.execute_task = original_execute
+
+        assert all(r["payload"]["status"] == "success" for r in responses)
+        # Concurrent: ~DELAY total. Sequential would be ~2*DELAY. Threshold
+        # sits well between the two with generous margin for scheduling jitter.
+        assert elapsed < DELAY * 1.7
     finally:
         for conn in connections.values():
             conn.close()
