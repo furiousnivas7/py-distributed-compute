@@ -1,4 +1,4 @@
-"""TCP worker client: connects to the master and exchanges RPC requests/responses."""
+"""TCP worker client: registers with the master, then executes TASK requests it sends."""
 
 import socket
 import uuid
@@ -6,6 +6,7 @@ import uuid
 from rpc import protocol
 from rpc.connection import Connection
 from rpc.protocol import build_message
+from worker.executor import execute_task
 
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 5000
@@ -29,9 +30,44 @@ def send_rpc(conn: Connection, msg_type: str, payload: dict | None = None) -> di
     return response
 
 
-def main():
+def register(conn: Connection) -> dict:
+    return send_rpc(
+        conn,
+        protocol.REGISTER,
+        {"worker_id": WORKER_ID, "host": WORKER_HOST, "port": WORKER_PORT},
+    )
+
+
+def serve_tasks(conn: Connection) -> None:
+    """Wait for TASK requests from the master, execute them, and reply with TASK_RESULT."""
+    while True:
+        try:
+            raw = conn.recv_bytes()
+        except ConnectionError:
+            return
+
+        request = protocol.decode_message(raw)
+        print(f"Received RPC: {request['type']}")
+
+        if request["type"] != protocol.TASK:
+            continue
+
+        task_payload = request["payload"]
+        task_id = task_payload["task_id"]
+        task_type = task_payload["task_type"]
+        task_args = task_payload["task_payload"]
+
+        result = execute_task(task_type, task_args)
+        print(f"Executed task {task_id}: {result}")
+
+        response = build_message(protocol.TASK_RESULT, request["request_id"], {"task_id": task_id, **result})
+        conn.send_bytes(protocol.encode_message(response))
+        print(f"Sent RPC: {protocol.TASK_RESULT}")
+
+
+def run_worker(master_host: str, master_port: int) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((MASTER_HOST, MASTER_PORT))
+    sock.connect((master_host, master_port))
     print("Connected to master")
     conn = Connection(sock)
 
@@ -39,14 +75,16 @@ def main():
         ping_response = send_rpc(conn, protocol.PING)
         print(f"Status: {ping_response['payload'].get('status')}")
 
-        register_response = send_rpc(
-            conn,
-            protocol.REGISTER,
-            {"worker_id": WORKER_ID, "host": WORKER_HOST, "port": WORKER_PORT},
-        )
+        register_response = register(conn)
         print(f"Status: {register_response['payload'].get('status')}")
+
+        serve_tasks(conn)
     finally:
         conn.close()
+
+
+def main():
+    run_worker(MASTER_HOST, MASTER_PORT)
 
 
 if __name__ == "__main__":

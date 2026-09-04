@@ -1,4 +1,4 @@
-"""TCP master server: accepts a worker connection and serves RPC requests over it."""
+"""TCP master server: registers a worker, then dispatches a task to it over RPC."""
 
 import socket
 
@@ -11,12 +11,17 @@ HOST = "127.0.0.1"
 PORT = 5000
 
 
-def serve_connection(conn: Connection) -> None:
+def accept_and_register(server_sock: socket.socket) -> tuple[Connection, str]:
+    """Accept one connection and handle requests until the worker registers.
+
+    Returns the open connection and the registered worker_id.
+    """
+    client_sock, addr = server_sock.accept()
+    print("Worker connected")
+    conn = Connection(client_sock)
+
     while True:
-        try:
-            raw = conn.recv_bytes()
-        except ConnectionError:
-            break
+        raw = conn.recv_bytes()
 
         try:
             request = protocol.decode_message(raw)
@@ -30,6 +35,24 @@ def serve_connection(conn: Connection) -> None:
         print(f"RPC response: {response['type']}")
         conn.send_bytes(protocol.encode_message(response))
 
+        if request["type"] == protocol.REGISTER and response["type"] == protocol.REGISTER_ACK:
+            return conn, request["payload"]["worker_id"]
+
+
+def dispatch_task(conn: Connection, task_id: str, task_type: str, task_payload: dict) -> dict:
+    """Send a TASK request to a worker and return its decoded TASK_RESULT response."""
+    request = build_message(
+        protocol.TASK,
+        request_id=f"task-{task_id}",
+        payload={"task_id": task_id, "task_type": task_type, "task_payload": task_payload},
+    )
+    print(f"RPC sent: {request['type']}")
+    conn.send_bytes(protocol.encode_message(request))
+
+    response = protocol.decode_message(conn.recv_bytes())
+    print(f"RPC received: {response['type']}")
+    return response
+
 
 def main():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -38,12 +61,11 @@ def main():
     server_sock.listen(1)
     print(f"Master started on {HOST}:{PORT}")
 
-    client_sock, addr = server_sock.accept()
-    print("Worker connected")
-    conn = Connection(client_sock)
+    conn, worker_id = accept_and_register(server_sock)
 
     try:
-        serve_connection(conn)
+        result = dispatch_task(conn, "task-1", "ADD", {"a": 10, "b": 20})
+        print(f"Task result: {result['payload']}")
     finally:
         conn.close()
         server_sock.close()
