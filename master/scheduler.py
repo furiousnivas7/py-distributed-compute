@@ -1,0 +1,131 @@
+"""Task scheduling and worker assignment."""
+
+from common.models import Task, TaskStatus, WorkerStatus
+from master.worker_manager import WorkerManager
+
+
+class TaskNotFoundError(KeyError):
+    """Raised when a task does not exist."""
+
+
+class NoAvailableWorkerError(RuntimeError):
+    """Raised when no idle worker is available."""
+
+
+class Scheduler:
+    def __init__(self, worker_manager: WorkerManager):
+        self.worker_manager = worker_manager
+        self._tasks: dict[str, Task] = {}
+
+    def submit_task(
+        self,
+        task_id: str,
+        task_type: str,
+        payload: dict,
+    ) -> Task:
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be a non-empty string")
+
+        if not isinstance(task_type, str) or not task_type:
+            raise ValueError("task_type must be a non-empty string")
+
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dictionary")
+
+        if task_id in self._tasks:
+            raise ValueError(f"Task already exists: {task_id}")
+
+        task = Task(
+            task_id=task_id,
+            task_type=task_type,
+            payload=payload,
+        )
+
+        self._tasks[task_id] = task
+        return task
+
+    def get_task(self, task_id: str) -> Task | None:
+        return self._tasks.get(task_id)
+
+    def get_all_tasks(self) -> list[Task]:
+        return list(self._tasks.values())
+
+    def assign_task(self, task_id: str) -> Task:
+        task = self._tasks.get(task_id)
+
+        if task is None:
+            raise TaskNotFoundError(f"Unknown task: {task_id}")
+
+        if task.status != TaskStatus.PENDING:
+            raise ValueError(
+                f"Task cannot be assigned from status: {task.status}"
+            )
+
+        workers = self.worker_manager.get_all_workers()
+
+        for worker in workers:
+            if worker.status == WorkerStatus.IDLE:
+                task.assigned_worker_id = worker.worker_id
+                task.status = TaskStatus.ASSIGNED
+
+                self.worker_manager.update_status(
+                    worker.worker_id,
+                    WorkerStatus.BUSY,
+                )
+
+                return task
+
+        raise NoAvailableWorkerError("No idle worker available")
+
+    def start_task(self, task_id: str) -> Task:
+        task = self._get_existing_task(task_id)
+
+        if task.status != TaskStatus.ASSIGNED:
+            raise ValueError(
+                f"Task cannot start from status: {task.status}"
+            )
+
+        task.status = TaskStatus.RUNNING
+        return task
+
+    def complete_task(self, task_id: str) -> Task:
+        task = self._get_existing_task(task_id)
+
+        if task.status not in (
+            TaskStatus.ASSIGNED,
+            TaskStatus.RUNNING,
+        ):
+            raise ValueError(
+                f"Task cannot complete from status: {task.status}"
+            )
+
+        task.status = TaskStatus.COMPLETED
+
+        if task.assigned_worker_id is not None:
+            self.worker_manager.update_status(
+                task.assigned_worker_id,
+                WorkerStatus.IDLE,
+            )
+
+        return task
+
+    def fail_task(self, task_id: str) -> Task:
+        task = self._get_existing_task(task_id)
+
+        task.status = TaskStatus.FAILED
+
+        if task.assigned_worker_id is not None:
+            self.worker_manager.update_status(
+                task.assigned_worker_id,
+                WorkerStatus.IDLE,
+            )
+
+        return task
+
+    def _get_existing_task(self, task_id: str) -> Task:
+        task = self._tasks.get(task_id)
+
+        if task is None:
+            raise TaskNotFoundError(f"Unknown task: {task_id}")
+
+        return task
