@@ -14,7 +14,7 @@ time by construction, so that whole problem doesn't exist here.
 
 import asyncio
 
-from common.models import WorkerStatus
+from common.models import TaskStatus, WorkerStatus
 from master import rpc_handler
 from master.scheduler import Scheduler
 from rpc import protocol
@@ -195,30 +195,101 @@ async def dispatch_assigned_task(task) -> dict:
     return response
 
 
-async def drain_pending_tasks() -> list[dict]:
+async def drain_tasks_for(task_ids: set[str] | None, poll_interval: float = 0.01, timeout: float = 30.0) -> list[dict]:
     """Repeatedly assign and dispatch PENDING tasks to IDLE workers until none remain.
 
     Each round assigns one task per currently-IDLE worker (pure in-memory,
     synchronous, no await) before dispatching that whole round concurrently
     via asyncio.gather -- the async equivalent of the threaded
     implementation's one-thread-per-task dispatch.
+
+    If `task_ids` is given, only tasks in that set are ever assigned or
+    reported on -- this is the fix for a real concurrency hazard: this
+    function (or failure_monitor, which calls it internally) can be
+    in-flight from more than one caller at once, and assign_next_pending_task
+    mutates a scheduler shared by all of them. Without scoping, whichever
+    caller's loop happens to run first can "steal" a task a DIFFERENT
+    caller submitted, and that task's response then lands in the stealing
+    caller's own `responses` list instead of ever reaching the caller that
+    actually needed it (see Phase 8.8 notes / tests/test_concurrent_dispatch.py
+    for the exact scenario). Passing this job's own task_ids means each
+    caller's assignment loop only ever touches its own tasks -- concurrent
+    callers no longer compete for the same task, so no lock is needed here:
+    every individual Scheduler/WorkerManager call is already atomic (none
+    of them contain an await), and disjoint task_id sets mean there's
+    nothing left to race over between two job-scoped callers.
+
+    Scoping introduces one wrinkle a global drain never had to deal with:
+    an idle-worker *shortage* is genuinely ambiguous for a scoped caller.
+    "No task was assignable this round" could mean "every one of my tasks
+    is done" (stop) or "my tasks are still pending but another concurrent
+    caller currently holds every idle worker" (wait, don't give up) --
+    workers are a resource shared across every job-scoped caller, by
+    design. So when task_ids is given and a round assigns nothing, this
+    checks whether any of `task_ids` are still non-terminal
+    (PENDING/ASSIGNED/RUNNING); if so it waits briefly and tries again,
+    bounded by `timeout` as a safety net against a genuinely-starved
+    workload (e.g. every worker has failed with none left to replace
+    them) hanging forever.
+
+    `drain_pending_tasks()` (task_ids=None) keeps the original global
+    behavior for callers that don't care about scoping -- the one-off
+    manual demo in run_server(), and any test driving a single job/worker
+    set in isolation. There, "nothing assignable" unambiguously means
+    "everything pending has been dispatched" (a single caller sees the
+    whole scheduler), so no wait/retry is needed and none is added. It
+    remains just as unsafe to call from multiple concurrent callers as it
+    always was; use this function with an explicit scope instead when more
+    than one caller may be dispatching at once.
     """
     responses = []
+    deadline = None
 
     while True:
         batch = []
         while True:
-            task = scheduler.assign_next_pending_task()
+            task = scheduler.assign_next_pending_task(task_ids)
             if task is None:
                 break
             batch.append(task)
 
-        if not batch:
+        if batch:
+            responses.extend(await asyncio.gather(*(dispatch_assigned_task(task) for task in batch)))
+            continue
+
+        if task_ids is None:
             break
 
-        responses.extend(await asyncio.gather(*(dispatch_assigned_task(task) for task in batch)))
+        outstanding = {
+            task.task_id
+            for task in scheduler.get_all_tasks()
+            if task.task_id in task_ids and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        }
+        if not outstanding:
+            break
+
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            deadline = loop.time() + timeout
+        elif loop.time() >= deadline:
+            break
+
+        await asyncio.sleep(poll_interval)
 
     return responses
+
+
+async def drain_pending_tasks() -> list[dict]:
+    """Drain every currently-PENDING task, regardless of who submitted it.
+
+    Kept for backward compatibility (run_server()'s demo, failure_monitor's
+    own opportunistic sweep, and any test driving a single job/worker set
+    in isolation) -- but NOT safe to call from multiple concurrent callers.
+    See drain_tasks_for()'s docstring for why, and use it with an explicit
+    task_ids scope instead whenever more than one caller may be dispatching
+    at the same time (e.g. jobs.map_reduce.run_map_reduce).
+    """
+    return await drain_tasks_for(None)
 
 
 async def failure_monitor(stop_event: asyncio.Event) -> None:

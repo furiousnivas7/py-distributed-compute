@@ -58,14 +58,24 @@ class Scheduler:
     def get_all_tasks(self) -> list[Task]:
         return list(self._tasks.values())
 
-    def assign_next_pending_task(self) -> Task | None:
+    def assign_next_pending_task(self, task_ids: set[str] | None = None) -> Task | None:
         """Assign the oldest PENDING task to an IDLE worker, if both exist.
 
-        Returns the assigned task, or None if there is no pending task or
-        no idle worker is currently available (the task stays PENDING).
+        If `task_ids` is given, only tasks whose task_id is in that set are
+        considered. This is what lets one caller (e.g. one MapReduce job's
+        dispatch loop) drain only the tasks it's responsible for, without
+        touching -- or being touched by -- another concurrent caller's
+        pending tasks. See master.async_server.drain_tasks_for.
+
+        Returns the assigned task, or None if there is no matching pending
+        task or no idle worker is currently available (the task stays
+        PENDING).
         """
         for task in self._tasks.values():
             if task.status != TaskStatus.PENDING:
+                continue
+
+            if task_ids is not None and task.task_id not in task_ids:
                 continue
 
             try:

@@ -60,7 +60,7 @@ def test_full_word_count_map_reduce_job():
             await async_server.wait_for_workers(2)
             return await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-1",
                 WORDS,
                 map_operation="WORD_COUNT",
@@ -89,7 +89,7 @@ def test_result_is_independent_of_partition_count(num_partitions):
             await async_server.wait_for_workers(2)
             return await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-1",
                 WORDS,
                 "WORD_COUNT",
@@ -116,7 +116,7 @@ def test_three_workers_share_the_job():
             await async_server.wait_for_workers(3)
             result = await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-1",
                 WORDS,
                 "WORD_COUNT",
@@ -148,7 +148,7 @@ def test_empty_input_produces_empty_result():
             await async_server.wait_for_workers(1)
             return await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-1",
                 [],
                 "WORD_COUNT",
@@ -175,7 +175,7 @@ def test_count_reduce_operation():
             await async_server.wait_for_workers(1)
             return await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-1",
                 WORDS,
                 "WORD_COUNT",
@@ -208,7 +208,7 @@ def test_map_failure_excludes_partition_but_job_still_completes():
             data = ["apple", "banana", "", "apple", "orange"]
             return await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-1",
                 data,
                 "WORD_COUNT",
@@ -239,7 +239,7 @@ def test_reduce_failure_propagates_explicitly_not_swallowed():
             with pytest.raises(ValueError):
                 await run_map_reduce(
                     async_server.scheduler,
-                    async_server.drain_pending_tasks,
+                    async_server.drain_tasks_for,
                     "job-1",
                     WORDS,
                     "WORD_COUNT",
@@ -282,7 +282,7 @@ def test_job_isolation_two_sequential_jobs_do_not_mix():
 
             result_a = await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-a",
                 ["apple", "apple", "banana"],
                 "WORD_COUNT",
@@ -291,7 +291,7 @@ def test_job_isolation_two_sequential_jobs_do_not_mix():
             )
             result_b = await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 "job-b",
                 ["cherry", "cherry", "cherry"],
                 "WORD_COUNT",
@@ -322,7 +322,7 @@ def test_deterministic_final_result_across_repeated_runs():
             await async_server.wait_for_workers(2)
             return await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_pending_tasks,
+                async_server.drain_tasks_for,
                 job_id,
                 WORDS,
                 "WORD_COUNT",
@@ -392,7 +392,7 @@ def test_concurrent_map_tasks_during_pipeline():
             mr_task = asyncio.create_task(
                 run_map_reduce(
                     async_server.scheduler,
-                    async_server.drain_pending_tasks,
+                    async_server.drain_tasks_for,
                     "job-1",
                     WORDS,
                     "WORD_COUNT",
@@ -472,7 +472,7 @@ def test_concurrent_reduce_tasks_during_pipeline():
             mr_task = asyncio.create_task(
                 run_map_reduce(
                     async_server.scheduler,
-                    async_server.drain_pending_tasks,
+                    async_server.drain_tasks_for,
                     "job-1",
                     WORDS,
                     "WORD_COUNT",
