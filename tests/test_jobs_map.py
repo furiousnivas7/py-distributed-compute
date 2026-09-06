@@ -1,7 +1,8 @@
 import pytest
 
 from common.models import TaskStatus
-from jobs.map import build_map_job, collect_map_results, partition
+from jobs.map import build_intermediate_results, build_map_job, collect_map_results, partition
+from jobs.models import ResultStatus
 from master.scheduler import Scheduler
 from master.worker_manager import WorkerManager
 
@@ -100,3 +101,80 @@ def test_collect_map_results_raises_on_missing_response():
 
     with pytest.raises(ValueError):
         collect_map_results(tasks, responses)
+
+
+def test_build_intermediate_results_success():
+    scheduler = Scheduler(WorkerManager())
+    tasks = build_map_job(scheduler, "job-1", "SQUARE", [1, 2, 3, 4], num_partitions=2)
+    tasks[0].assigned_worker_id = "worker-1"
+    tasks[0].attempt = 1
+    tasks[1].assigned_worker_id = "worker-2"
+    tasks[1].attempt = 1
+
+    responses = [
+        _response("job-1-map-0", "success", result=[1, 4]),
+        _response("job-1-map-1", "success", result=[9, 16]),
+    ]
+
+    results = build_intermediate_results("job-1", tasks, responses)
+
+    assert len(results) == 2
+    assert [r.partition_id for r in results] == [0, 1]
+    assert results[0].job_id == "job-1"
+    assert results[0].task_id == "job-1-map-0"
+    assert results[0].status == ResultStatus.SUCCESS
+    assert results[0].data == [1, 4]
+    assert results[0].worker_id == "worker-1"
+    assert results[1].data == [9, 16]
+    assert results[1].worker_id == "worker-2"
+
+
+def test_build_intermediate_results_preserves_partition_order_regardless_of_response_order():
+    scheduler = Scheduler(WorkerManager())
+    tasks = build_map_job(scheduler, "job-1", "SQUARE", [1, 2, 3, 4], num_partitions=2)
+
+    # Responses arrive out of partition order.
+    responses = [
+        _response("job-1-map-1", "success", result=[9, 16]),
+        _response("job-1-map-0", "success", result=[1, 4]),
+    ]
+
+    results = build_intermediate_results("job-1", tasks, responses)
+
+    assert [r.partition_id for r in results] == [0, 1]
+    assert results[0].data == [1, 4]
+    assert results[1].data == [9, 16]
+
+
+def test_build_intermediate_results_records_failure_without_raising():
+    scheduler = Scheduler(WorkerManager())
+    tasks = build_map_job(scheduler, "job-1", "SQUARE", [1, 2], num_partitions=1)
+    tasks[0].assigned_worker_id = "worker-1"
+
+    responses = [_response("job-1-map-0", "error", message="bad data")]
+
+    results = build_intermediate_results("job-1", tasks, responses)
+
+    assert len(results) == 1
+    assert results[0].status == ResultStatus.ERROR
+    assert results[0].message == "bad data"
+    assert results[0].data is None
+    assert results[0].worker_id == "worker-1"
+
+
+def test_build_intermediate_results_records_missing_response_without_raising():
+    scheduler = Scheduler(WorkerManager())
+    tasks = build_map_job(scheduler, "job-1", "SQUARE", [1, 2, 3, 4], num_partitions=2)
+
+    responses = [_response("job-1-map-0", "success", result=[1, 4])]
+
+    results = build_intermediate_results("job-1", tasks, responses)
+
+    assert len(results) == 2
+    assert results[0].status == ResultStatus.SUCCESS
+    assert results[1].status == ResultStatus.ERROR
+    assert results[1].message == "No response received"
+
+
+def test_build_intermediate_results_empty_job():
+    assert build_intermediate_results("job-1", [], []) == []

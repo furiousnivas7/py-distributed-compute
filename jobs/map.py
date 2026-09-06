@@ -9,6 +9,7 @@ second scheduler, no MapReduce-specific dispatch logic.
 """
 
 from common.models import Task
+from jobs.models import IntermediateResult, ResultStatus
 from master.scheduler import Scheduler
 
 
@@ -85,3 +86,66 @@ def collect_map_results(tasks: list[Task], responses: list[dict]) -> list:
         combined.extend(payload["result"])
 
     return combined
+
+
+def build_intermediate_results(job_id: str, tasks: list[Task], responses: list[dict]) -> list[IntermediateResult]:
+    """Turn a Map job's task responses into an ordered list of
+    IntermediateResult, one per partition (partition_id = index in `tasks`,
+    the same partition order build_map_job produced).
+
+    Unlike collect_map_results (which raises on any failure or missing
+    response and flattens straight to a final list), this tolerates
+    failed/missing partitions by recording them as ERROR results instead
+    of raising, and keeps each partition's provenance (worker_id, attempt)
+    -- useful for inspecting a job's health, or for a later Shuffle/Reduce
+    stage that needs structured input rather than a flat list.
+    """
+    responses_by_task_id = {response["payload"]["task_id"]: response for response in responses}
+
+    results = []
+    for partition_id, task in enumerate(tasks):
+        response = responses_by_task_id.get(task.task_id)
+
+        if response is None:
+            results.append(
+                IntermediateResult(
+                    job_id=job_id,
+                    partition_id=partition_id,
+                    task_id=task.task_id,
+                    status=ResultStatus.ERROR,
+                    message="No response received",
+                    worker_id=task.assigned_worker_id,
+                    attempt=task.attempt,
+                )
+            )
+            continue
+
+        payload = response["payload"]
+        attempt = payload.get("attempt", task.attempt)
+
+        if payload["status"] == ResultStatus.SUCCESS:
+            results.append(
+                IntermediateResult(
+                    job_id=job_id,
+                    partition_id=partition_id,
+                    task_id=task.task_id,
+                    status=ResultStatus.SUCCESS,
+                    data=payload["result"],
+                    worker_id=task.assigned_worker_id,
+                    attempt=attempt,
+                )
+            )
+        else:
+            results.append(
+                IntermediateResult(
+                    job_id=job_id,
+                    partition_id=partition_id,
+                    task_id=task.task_id,
+                    status=ResultStatus.ERROR,
+                    message=payload.get("message"),
+                    worker_id=task.assigned_worker_id,
+                    attempt=attempt,
+                )
+            )
+
+    return results
