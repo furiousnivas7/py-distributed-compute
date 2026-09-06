@@ -81,3 +81,69 @@ def test_map_non_numeric_element_rejected():
 def test_map_boolean_element_rejected():
     result = execute_task("MAP", {"operation": "SQUARE", "data": [1, True, 3]})
     assert result["status"] == "error"
+
+
+def test_map_word_count():
+    result = execute_task("MAP", {"operation": "WORD_COUNT", "data": ["apple", "banana", "apple"]})
+    assert result == {"status": "success", "result": [["apple", 1], ["banana", 1], ["apple", 1]]}
+
+
+def test_map_word_count_empty_data():
+    result = execute_task("MAP", {"operation": "WORD_COUNT", "data": []})
+    assert result == {"status": "success", "result": []}
+
+
+def test_map_word_count_non_string_element_rejected():
+    result = execute_task("MAP", {"operation": "WORD_COUNT", "data": ["apple", 5]})
+    assert result["status"] == "error"
+
+
+def test_map_word_count_empty_string_rejected():
+    result = execute_task("MAP", {"operation": "WORD_COUNT", "data": ["apple", ""]})
+    assert result["status"] == "error"
+
+
+def test_reduce_sum():
+    result = execute_task("REDUCE", {"operation": "SUM", "values": [1, 1, 1, 1]})
+    assert result == {"status": "success", "result": 4}
+
+
+def test_reduce_count():
+    result = execute_task("REDUCE", {"operation": "COUNT", "values": [1, 1, 1]})
+    assert result == {"status": "success", "result": 3}
+
+
+def test_reduce_max():
+    result = execute_task("REDUCE", {"operation": "MAX", "values": [3, 7, 2]})
+    assert result == {"status": "success", "result": 7}
+
+
+def test_reduce_min():
+    result = execute_task("REDUCE", {"operation": "MIN", "values": [3, 7, 2]})
+    assert result == {"status": "success", "result": 2}
+
+
+def test_reduce_unknown_operation():
+    result = execute_task("REDUCE", {"operation": "AVERAGE", "values": [1, 2, 3]})
+    assert result["status"] == "error"
+    assert "AVERAGE" in result["message"]
+
+
+def test_reduce_empty_values_rejected():
+    result = execute_task("REDUCE", {"operation": "SUM", "values": []})
+    assert result["status"] == "error"
+
+
+def test_reduce_values_not_a_list_rejected():
+    result = execute_task("REDUCE", {"operation": "SUM", "values": 5})
+    assert result["status"] == "error"
+
+
+def test_reduce_non_numeric_value_rejected():
+    result = execute_task("REDUCE", {"operation": "SUM", "values": [1, "x", 3]})
+    assert result["status"] == "error"
+
+
+def test_reduce_boolean_value_rejected():
+    result = execute_task("REDUCE", {"operation": "SUM", "values": [1, True, 3]})
+    assert result["status"] == "error"

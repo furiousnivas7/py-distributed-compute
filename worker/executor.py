@@ -3,15 +3,31 @@
 ADD = "ADD"
 MULTIPLY = "MULTIPLY"
 MAP = "MAP"
+REDUCE = "REDUCE"
 
 # Named operations only -- no arbitrary Python function serialization.
 # Keeps the wire protocol a fixed, deterministic vocabulary rather than
 # shipping code between processes.
-MAP_OPERATIONS = {
+NUMERIC_MAP_OPERATIONS = {
     "SQUARE": lambda x: x * x,
     "DOUBLE": lambda x: x * 2,
     "INCREMENT": lambda x: x + 1,
     "NEGATE": lambda x: -x,
+}
+
+# Key/value-emitting operations, for jobs that feed into Shuffle/Reduce
+# (jobs/shuffle.py) rather than producing a flat transformed list.
+KEY_VALUE_MAP_OPERATIONS = {
+    "WORD_COUNT": lambda word: [word, 1],
+}
+
+MAP_OPERATIONS = {**NUMERIC_MAP_OPERATIONS, **KEY_VALUE_MAP_OPERATIONS}
+
+REDUCE_OPERATIONS = {
+    "SUM": sum,
+    "COUNT": len,
+    "MAX": max,
+    "MIN": min,
 }
 
 
@@ -40,12 +56,38 @@ def execute_map(payload: dict):
         raise ExecutionError("payload must contain a list field 'data'")
 
     fn = MAP_OPERATIONS[operation]
+
+    if operation in KEY_VALUE_MAP_OPERATIONS:
+        mapped = []
+        for value in data:
+            if not isinstance(value, str) or not value:
+                raise ExecutionError(f"{operation} data must contain only non-empty strings")
+            mapped.append(fn(value))
+        return mapped
+
     mapped = []
     for value in data:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ExecutionError("MAP data must contain only numeric values")
         mapped.append(fn(value))
     return mapped
+
+
+def execute_reduce(payload: dict):
+    operation = payload.get("operation")
+    values = payload.get("values")
+
+    if operation not in REDUCE_OPERATIONS:
+        raise ExecutionError(f"Unsupported REDUCE operation: {operation}")
+
+    if not isinstance(values, list) or not values:
+        raise ExecutionError("payload must contain a non-empty list field 'values'")
+
+    for value in values:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ExecutionError("REDUCE values must contain only numeric values")
+
+    return REDUCE_OPERATIONS[operation](values)
 
 
 def _require_numbers(payload: dict):
@@ -61,6 +103,7 @@ HANDLERS = {
     ADD: execute_add,
     MULTIPLY: execute_multiply,
     MAP: execute_map,
+    REDUCE: execute_reduce,
 }
 
 
