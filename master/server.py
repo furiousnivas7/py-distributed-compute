@@ -11,7 +11,18 @@ from rpc.protocol import ProtocolError, build_message
 
 HOST = "127.0.0.1"
 PORT = 5000
+# Heartbeats get their own listening port rather than sharing PORT. If both
+# accept_and_register()'s loop and heartbeat_listener() called accept() on
+# the SAME listening socket from different threads, the kernel could hand a
+# brand-new worker's registration connection to whichever thread happened to
+# be waiting in accept() — if that's the heartbeat listener, it would treat
+# the connection as a single fire-and-forget request and close it after one
+# message, breaking that worker's PING/REGISTER handshake. Separate sockets
+# make that race impossible.
+HEARTBEAT_PORT = 5001
 EXPECTED_WORKERS = 2
+HEARTBEAT_TIMEOUT = 5.0
+FAILURE_CHECK_INTERVAL = 1.0
 
 worker_manager = rpc_handler.worker_manager
 scheduler = Scheduler(worker_manager)
@@ -71,6 +82,48 @@ def accept_and_handle_one(server_sock: socket.socket) -> tuple[dict, dict]:
         return request, response
     finally:
         conn.close()
+
+
+def handle_heartbeat_connection(conn: Connection) -> None:
+    """Serve exactly one request on an accepted heartbeat connection, then close it."""
+    try:
+        request = protocol.decode_message(conn.recv_bytes())
+        response = rpc_handler.handle_request(request)
+        conn.send_bytes(protocol.encode_message(response))
+    finally:
+        conn.close()
+
+
+def heartbeat_listener(heartbeat_sock: socket.socket, stop_event: threading.Event) -> None:
+    """Continuously accept short-lived HEARTBEAT connections on their own port.
+
+    Runs on a background thread for the master's whole lifetime, since
+    workers connect fresh for every heartbeat rather than keeping one open.
+    A short accept() timeout lets this loop notice stop_event promptly
+    instead of blocking in accept() forever.
+    """
+    heartbeat_sock.settimeout(0.5)
+
+    while not stop_event.is_set():
+        try:
+            client_sock, addr = heartbeat_sock.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            return
+
+        conn = Connection(client_sock)
+        threading.Thread(target=handle_heartbeat_connection, args=(conn,), daemon=True).start()
+
+
+def failure_monitor(stop_event: threading.Event) -> None:
+    """Every FAILURE_CHECK_INTERVAL seconds, mark workers FAILED if they've
+    gone HEARTBEAT_TIMEOUT seconds without a heartbeat."""
+    while not stop_event.wait(FAILURE_CHECK_INTERVAL):
+        stale_workers = worker_manager.get_stale_workers(HEARTBEAT_TIMEOUT)
+
+        for worker in stale_workers:
+            print(f"Worker failed: {worker.worker_id}")
 
 
 def dispatch_task(conn: Connection, task_id: str, task_type: str, task_payload: dict) -> dict:
@@ -188,7 +241,19 @@ def main():
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((HOST, PORT))
     server_sock.listen(EXPECTED_WORKERS)
-    print(f"Master started on {HOST}:{PORT}")
+
+    heartbeat_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    heartbeat_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    heartbeat_sock.bind((HOST, HEARTBEAT_PORT))
+    heartbeat_sock.listen(EXPECTED_WORKERS)
+
+    print(f"Master started on {HOST}:{PORT} (heartbeats on {HEARTBEAT_PORT})")
+
+    stop_event = threading.Event()
+    heartbeat_thread = threading.Thread(target=heartbeat_listener, args=(heartbeat_sock, stop_event), daemon=True)
+    monitor_thread = threading.Thread(target=failure_monitor, args=(stop_event,), daemon=True)
+    heartbeat_thread.start()
+    monitor_thread.start()
 
     connections: dict[str, Connection] = {}
     for _ in range(EXPECTED_WORKERS):
@@ -216,9 +281,13 @@ def main():
         for task in scheduler.get_all_tasks():
             print(f"  {task.task_id}: {task.status} (worker={task.assigned_worker_id})")
     finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=2)
+        monitor_thread.join(timeout=2)
         for conn in connections.values():
             conn.close()
         server_sock.close()
+        heartbeat_sock.close()
 
 
 if __name__ == "__main__":

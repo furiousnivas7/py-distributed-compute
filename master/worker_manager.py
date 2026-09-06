@@ -72,6 +72,23 @@ class WorkerManager:
         worker.last_heartbeat = time.time()
         return worker
 
+    def get_stale_workers(self, timeout: float) -> list[Worker]:
+        """Mark FAILED and return every worker whose last heartbeat is older
+        than `timeout` seconds. A worker that has never sent a heartbeat
+        (last_heartbeat is None) is skipped, not treated as stale."""
+        now = time.time()
+        stale_workers = []
+
+        for worker in self._workers.values():
+            if worker.last_heartbeat is None:
+                continue
+
+            if now - worker.last_heartbeat > timeout:
+                worker.status = WorkerStatus.FAILED
+                stale_workers.append(worker)
+
+        return stale_workers
+
     def remove_worker(self, worker_id: str) -> None:
         if worker_id not in self._workers:
             raise WorkerNotFoundError(f"Unknown worker: {worker_id}")

@@ -11,12 +11,17 @@ from worker.executor import execute_task
 
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 5000
+MASTER_HEARTBEAT_PORT = 5001
 
 WORKER_ID = "worker-1"
 WORKER_HOST = "127.0.0.1"
 WORKER_PORT = 6001
 
-HEARTBEAT_INTERVAL_SECONDS = 5
+# Must stay well below master.server.HEARTBEAT_TIMEOUT (5.0s). A live worker's
+# first heartbeat doesn't fire until one full interval after it starts, so an
+# interval too close to the timeout can make a healthy worker look FAILED
+# just from scheduling/network jitter around that first send.
+HEARTBEAT_INTERVAL_SECONDS = 1.5
 
 
 def new_request_id() -> str:
@@ -106,11 +111,15 @@ def run_worker(
     worker_id: str = WORKER_ID,
     worker_host: str = WORKER_HOST,
     worker_port: int = WORKER_PORT,
+    heartbeat_port: int | None = None,
 ) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((master_host, master_port))
     print("Connected to master")
     conn = Connection(sock)
+
+    stop_heartbeat = threading.Event()
+    heartbeat_thread = None
 
     try:
         ping_response = send_rpc(conn, protocol.PING)
@@ -119,13 +128,24 @@ def run_worker(
         register_response = register(conn, worker_id, worker_host, worker_port)
         print(f"Status: {register_response['payload'].get('status')}")
 
+        if heartbeat_port is not None:
+            heartbeat_thread = threading.Thread(
+                target=start_heartbeat_loop,
+                args=(master_host, heartbeat_port, worker_id, stop_heartbeat),
+                daemon=True,
+            )
+            heartbeat_thread.start()
+
         serve_tasks(conn)
     finally:
+        stop_heartbeat.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2)
         conn.close()
 
 
 def main():
-    run_worker(MASTER_HOST, MASTER_PORT)
+    run_worker(MASTER_HOST, MASTER_PORT, heartbeat_port=MASTER_HEARTBEAT_PORT)
 
 
 if __name__ == "__main__":

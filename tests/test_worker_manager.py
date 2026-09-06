@@ -77,6 +77,46 @@ def test_record_heartbeat_missing_worker_raises(manager):
         manager.record_heartbeat("missing")
 
 
+def test_get_stale_workers_recent_heartbeat_is_not_stale(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    manager.get_worker("worker-1").last_heartbeat = time.time()
+
+    assert manager.get_stale_workers(timeout=5) == []
+    assert manager.get_worker("worker-1").status == WorkerStatus.IDLE
+
+
+def test_get_stale_workers_old_heartbeat_marks_failed(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    manager.get_worker("worker-1").last_heartbeat = time.time() - 10
+
+    stale = manager.get_stale_workers(timeout=5)
+
+    assert [w.worker_id for w in stale] == ["worker-1"]
+    assert manager.get_worker("worker-1").status == WorkerStatus.FAILED
+
+
+def test_get_stale_workers_mixed_workers(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    manager.register_worker("worker-2", "127.0.0.1", 6002)
+
+    manager.get_worker("worker-1").last_heartbeat = time.time() - 10
+    manager.get_worker("worker-2").last_heartbeat = time.time()
+
+    stale = manager.get_stale_workers(timeout=5)
+
+    assert [w.worker_id for w in stale] == ["worker-1"]
+    assert manager.get_worker("worker-1").status == WorkerStatus.FAILED
+    assert manager.get_worker("worker-2").status == WorkerStatus.IDLE
+
+
+def test_get_stale_workers_never_heartbeat_is_skipped(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    manager.get_worker("worker-1").last_heartbeat = None
+
+    assert manager.get_stale_workers(timeout=5) == []
+    assert manager.get_worker("worker-1").status == WorkerStatus.IDLE
+
+
 def test_remove_worker(manager):
     manager.register_worker("worker-1", "127.0.0.1", 6001)
     manager.remove_worker("worker-1")

@@ -415,3 +415,76 @@ def test_heartbeat_loop_sends_periodically():
         conn.close()
         server_sock.close()
         worker_thread.join(timeout=2)
+
+
+def test_heartbeat_listener_accepts_connections_on_dedicated_port():
+    """heartbeat_listener runs on its own socket, separate from the one
+    accept_and_register uses, so registration and heartbeats can't race."""
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+    heartbeat_sock = start_server_socket()
+    heartbeat_port = heartbeat_sock.getsockname()[1]
+
+    worker_thread = threading.Thread(target=worker.run_worker, args=("127.0.0.1", port), daemon=True)
+    worker_thread.start()
+    conn, worker_id = master_server.accept_and_register(server_sock)
+
+    stop_event = threading.Event()
+    listener_thread = threading.Thread(
+        target=master_server.heartbeat_listener, args=(heartbeat_sock, stop_event), daemon=True
+    )
+    listener_thread.start()
+
+    try:
+        for _ in range(3):
+            response = worker.send_heartbeat("127.0.0.1", heartbeat_port, worker_id)
+            assert response["type"] == protocol.HEARTBEAT_ACK
+
+        assert master_server.worker_manager.get_worker(worker_id).last_heartbeat is not None
+    finally:
+        stop_event.set()
+        listener_thread.join(timeout=2)
+        conn.close()
+        server_sock.close()
+        heartbeat_sock.close()
+        worker_thread.join(timeout=2)
+
+
+def test_failure_monitor_detects_stale_worker(monkeypatch):
+    """Test 4: start the background monitor, force a worker stale, confirm
+    it flips to FAILED on its own, then stop the monitor."""
+    monkeypatch.setattr(master_server, "FAILURE_CHECK_INTERVAL", 0.05)
+    monkeypatch.setattr(master_server, "HEARTBEAT_TIMEOUT", 1.0)
+
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+
+    worker_thread = threading.Thread(target=worker.run_worker, args=("127.0.0.1", port), daemon=True)
+    worker_thread.start()
+    conn, worker_id = master_server.accept_and_register(server_sock)
+
+    stop_event = threading.Event()
+    monitor_thread = threading.Thread(target=master_server.failure_monitor, args=(stop_event,), daemon=True)
+
+    try:
+        assert master_server.worker_manager.get_worker(worker_id).status == "IDLE"
+
+        # Force staleness directly instead of waiting out a real timeout.
+        master_server.worker_manager.get_worker(worker_id).last_heartbeat = time.time() - 10
+
+        monitor_thread.start()
+
+        deadline = time.monotonic() + 2
+        while (
+            master_server.worker_manager.get_worker(worker_id).status != "FAILED"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+
+        assert master_server.worker_manager.get_worker(worker_id).status == "FAILED"
+    finally:
+        stop_event.set()
+        monitor_thread.join(timeout=2)
+        conn.close()
+        server_sock.close()
+        worker_thread.join(timeout=2)
