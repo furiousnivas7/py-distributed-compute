@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from common.models import TaskStatus, WorkerStatus
 from master import rpc_handler, server as master_server
 from rpc import protocol
 from rpc.connection import Connection
@@ -62,11 +63,56 @@ def run_gated_worker(host: str, port: int, worker_id: str, ready_event: threadin
             response = protocol.build_message(
                 protocol.TASK_RESULT,
                 request["request_id"],
-                {"task_id": task_payload["task_id"], **result},
+                {"task_id": task_payload["task_id"], "attempt": task_payload.get("attempt", 1), **result},
             )
             conn.send_bytes(protocol.encode_message(response))
     finally:
         conn.close()
+
+
+def run_crashing_worker(
+    host: str, port: int, worker_id: str, received_event: threading.Event, task_count: int = 1
+) -> None:
+    """Registers normally, then on receiving `task_count` TASK messages,
+    closes the connection without ever sending a TASK_RESULT — simulating a
+    worker that crashes mid-task. Sets `received_event` right before closing
+    so a test can synchronize on "the task(s) were actually delivered"
+    instead of sleeping."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    conn = Connection(sock)
+
+    worker.send_rpc(conn, protocol.PING)
+    worker.register(conn, worker_id, "127.0.0.1", 6000)
+
+    for _ in range(task_count):
+        request = protocol.decode_message(conn.recv_bytes())
+        assert request["type"] == protocol.TASK
+
+    received_event.set()
+    conn.close()
+
+
+def send_task_message(conn: Connection, task) -> None:
+    """Send a TASK for `task` without waiting for a reply.
+
+    Unlike dispatch_task/dispatch_assigned_task, this never blocks on
+    recv_bytes(). Used to put two tasks "in flight" on the same connection
+    sequentially from one thread — dispatch_assigned_task's blocking recv
+    would prevent that, and firing both from separate threads on the same
+    Connection would risk their sendall() calls interleaving mid-message.
+    """
+    request = protocol.build_message(
+        protocol.TASK,
+        request_id=f"task-{task.task_id}",
+        payload={
+            "task_id": task.task_id,
+            "task_type": task.task_type,
+            "task_payload": task.payload,
+            "attempt": task.attempt,
+        },
+    )
+    conn.send_bytes(protocol.encode_message(request))
 
 
 def test_task_dispatched_and_executed_over_real_tcp():
@@ -83,7 +129,7 @@ def test_task_dispatched_and_executed_over_real_tcp():
         response = master_server.dispatch_task(conn, "task-1", "ADD", {"a": 10, "b": 20})
 
         assert response["type"] == protocol.TASK_RESULT
-        assert response["payload"] == {"task_id": "task-1", "status": "success", "result": 30}
+        assert response["payload"] == {"task_id": "task-1", "attempt": 1, "status": "success", "result": 30}
     finally:
         conn.close()
         server_sock.close()
@@ -103,7 +149,7 @@ def test_multiply_task_dispatched_and_executed():
         conn, _ = master_server.accept_and_register(server_sock)
         response = master_server.dispatch_task(conn, "task-2", "MULTIPLY", {"a": 4, "b": 5})
 
-        assert response["payload"] == {"task_id": "task-2", "status": "success", "result": 20}
+        assert response["payload"] == {"task_id": "task-2", "attempt": 1, "status": "success", "result": 20}
     finally:
         conn.close()
         server_sock.close()
@@ -488,3 +534,304 @@ def test_failure_monitor_detects_stale_worker(monkeypatch):
         conn.close()
         server_sock.close()
         worker_thread.join(timeout=2)
+
+
+def test_failed_worker_requeues_assigned_tasks():
+    """6.6.3: detecting a stale worker and requeuing its tasks is one
+    atomic step (both driven by master_server's shared state), so a task
+    never ends up ASSIGNED-to-a-dead-worker at the same time it's PENDING."""
+    master_server.worker_manager.register_worker("worker-1", "127.0.0.1", 6001)
+
+    task = master_server.scheduler.submit_task("task-1", "ADD", {"a": 10, "b": 20})
+    master_server.scheduler.assign_task("task-1")
+
+    worker_record = master_server.worker_manager.get_worker("worker-1")
+    assert worker_record is not None
+    assert task.assigned_worker_id == "worker-1"
+
+    worker_record.last_heartbeat = time.time() - 10
+
+    stale_workers = master_server.worker_manager.get_stale_workers(master_server.HEARTBEAT_TIMEOUT)
+    for stale_worker in stale_workers:
+        master_server.scheduler.requeue_tasks_for_worker(stale_worker.worker_id)
+
+    assert worker_record.status == WorkerStatus.FAILED
+    assert task.status == TaskStatus.PENDING
+    assert task.assigned_worker_id is None
+
+
+def test_stale_attempt_result_does_not_overwrite_newer_attempt():
+    """6.6.4's key test: attempt 1's late TASK_RESULT must not clobber
+    attempt 2's state once the task has been requeued and reassigned to a
+    different worker while attempt 1's reply was still in flight.
+
+    A fake connection simulates the race directly: its recv_bytes() (called
+    from inside dispatch_task, while dispatch_assigned_task is "waiting on
+    worker-1") is exactly where the requeue + reassignment to worker-2
+    happens, before the stale attempt-1 reply is finally handed back.
+    """
+    master_server.worker_manager.register_worker("worker-1", "127.0.0.1", 6001)
+    master_server.worker_manager.register_worker("worker-2", "127.0.0.1", 6002)
+
+    task = master_server.scheduler.submit_task("task-1", "ADD", {"a": 1, "b": 1})
+    master_server.scheduler.assign_task("task-1")
+    assert task.attempt == 1
+    assert task.assigned_worker_id == "worker-1"
+
+    class StaleWorkerConnection:
+        def send_bytes(self, data):
+            pass
+
+        def recv_bytes(self):
+            master_server.scheduler.requeue_tasks_for_worker("worker-1")
+            master_server.worker_manager.update_status("worker-1", WorkerStatus.FAILED)
+            reassigned = master_server.scheduler.assign_next_pending_task()
+            assert reassigned.assigned_worker_id == "worker-2"
+            assert reassigned.attempt == 2
+
+            stale_response = protocol.build_message(
+                protocol.TASK_RESULT,
+                "task-task-1",
+                {"task_id": "task-1", "attempt": 1, "status": "success", "result": 999},
+            )
+            return protocol.encode_message(stale_response)
+
+    connections = {"worker-1": StaleWorkerConnection()}
+
+    response = master_server.dispatch_assigned_task(connections, task)
+
+    # The raw (stale) reply is still returned to the caller...
+    assert response["payload"]["result"] == 999
+    # ...but it must not have been applied: task-1 now belongs to attempt 2.
+    assert task.attempt == 2
+    assert task.assigned_worker_id == "worker-2"
+    assert task.status == TaskStatus.ASSIGNED
+    assert master_server.worker_manager.get_worker("worker-2").status == WorkerStatus.BUSY
+
+
+def test_failed_worker_task_is_requeued_and_completed_by_another_worker(monkeypatch):
+    """6.6.5: the full fault-tolerance pipeline over real TCP.
+
+    worker-1 and worker-2 both register for real. worker-1 receives a real
+    TASK and then closes its connection without replying (a genuine crash,
+    not a mock). The failure monitor detects it, requeues task-1, and the
+    real (unmodified) worker-2 completes it — attempt 1 -> 2, worker-1 ->
+    worker-2, PENDING -> COMPLETED.
+
+    Staleness is forced directly (as in 6.5.5) rather than waiting out a
+    real heartbeat cycle: worker-1 never runs a heartbeat loop here since it
+    dies right after the task, so there's nothing for a live heartbeat
+    listener to add to this particular test.
+    """
+    monkeypatch.setattr(master_server, "FAILURE_CHECK_INTERVAL", 0.05)
+    monkeypatch.setattr(master_server, "HEARTBEAT_TIMEOUT", 1.0)
+
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+
+    # Register worker-1 fully before even starting worker-2, so which one
+    # ends up assigned task-1 (the next section assumes worker-1) isn't a
+    # race between two connections starting up concurrently.
+    received_event = threading.Event()
+    worker1_thread = threading.Thread(
+        target=run_crashing_worker, args=("127.0.0.1", port, "worker-1", received_event), daemon=True
+    )
+    worker1_thread.start()
+    conn1, worker1_id = master_server.accept_and_register(server_sock)
+    assert worker1_id == "worker-1"
+
+    worker2_thread = threading.Thread(
+        target=worker.run_worker,
+        args=("127.0.0.1", port),
+        kwargs={"worker_id": "worker-2"},
+        daemon=True,
+    )
+    worker2_thread.start()
+    conn2, worker2_id = master_server.accept_and_register(server_sock)
+    assert worker2_id == "worker-2"
+
+    connections = {worker1_id: conn1, worker2_id: conn2}
+
+    stop_event = threading.Event()
+    monitor_thread = threading.Thread(target=master_server.failure_monitor, args=(stop_event,), daemon=True)
+    monitor_started = False
+
+    try:
+        task = master_server.scheduler.submit_task("task-1", "ADD", {"a": 10, "b": 20})
+        with master_server._state_lock:
+            assigned = master_server.scheduler.assign_task("task-1")
+        assert assigned.assigned_worker_id == "worker-1"
+        assert assigned.attempt == 1
+
+        dispatch_thread = threading.Thread(
+            target=master_server.dispatch_assigned_task, args=(connections, task), daemon=True
+        )
+        dispatch_thread.start()
+
+        # worker-1 has received the TASK and is about to "crash" (close its
+        # connection without replying) — synchronized via the event, not sleep.
+        assert received_event.wait(timeout=5)
+
+        # Force staleness directly instead of waiting out a real heartbeat cycle.
+        master_server.worker_manager.get_worker("worker-1").last_heartbeat = time.time() - 10
+
+        monitor_thread.start()
+        monitor_started = True
+
+        deadline = time.monotonic() + 5
+        while (
+            master_server.worker_manager.get_worker("worker-1").status != WorkerStatus.FAILED
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+
+        assert master_server.worker_manager.get_worker("worker-1").status == WorkerStatus.FAILED
+        assert task.status == TaskStatus.PENDING
+        assert task.assigned_worker_id is None
+        assert task.attempt == 1  # requeue does not reset the attempt count
+
+        with master_server._state_lock:
+            reassigned = master_server.scheduler.assign_next_pending_task()
+
+        assert reassigned is task
+        assert task.assigned_worker_id == "worker-2"
+        assert task.attempt == 2
+
+        response = master_server.dispatch_assigned_task(connections, task)
+
+        assert response["type"] == protocol.TASK_RESULT
+        assert response["payload"]["attempt"] == 2
+        assert response["payload"]["status"] == "success"
+        assert response["payload"]["result"] == 30
+
+        assert task.status == TaskStatus.COMPLETED
+        assert task.assigned_worker_id == "worker-2"
+
+        # The stale worker-1 dispatch (still unwinding from its dead
+        # connection) must not have clobbered attempt 2's COMPLETED outcome.
+        dispatch_thread.join(timeout=5)
+        assert not dispatch_thread.is_alive()
+        assert task.status == TaskStatus.COMPLETED
+        assert task.assigned_worker_id == "worker-2"
+        assert master_server.worker_manager.get_worker("worker-2").status == WorkerStatus.IDLE
+    finally:
+        stop_event.set()
+        if monitor_started:
+            monitor_thread.join(timeout=2)
+        for conn in connections.values():
+            conn.close()
+        server_sock.close()
+        worker1_thread.join(timeout=2)
+        worker2_thread.join(timeout=2)
+
+
+def test_multiple_tasks_survive_one_worker_failure(monkeypatch):
+    """6.6.6.5: worker-1 has TWO tasks in flight when it crashes. Both must
+    be requeued and both must end up COMPLETED on worker-2.
+
+    Our scheduler only ever assigns a task to an IDLE worker (assignment
+    flips it to BUSY), so "two tasks on one worker" isn't reachable through
+    the normal assign_next_pending_task() path — the same IDLE-toggle trick
+    used in test_requeue_multiple_tasks_for_failed_worker (scheduler tests)
+    is used here to put both tasks on worker-1 before sending their real
+    TASK messages over the wire.
+    """
+    monkeypatch.setattr(master_server, "FAILURE_CHECK_INTERVAL", 0.05)
+    monkeypatch.setattr(master_server, "HEARTBEAT_TIMEOUT", 1.0)
+
+    server_sock = start_server_socket()
+    port = server_sock.getsockname()[1]
+
+    received_event = threading.Event()
+    worker1_thread = threading.Thread(
+        target=run_crashing_worker,
+        args=("127.0.0.1", port, "worker-1", received_event),
+        kwargs={"task_count": 2},
+        daemon=True,
+    )
+    worker1_thread.start()
+    conn1, worker1_id = master_server.accept_and_register(server_sock)
+    assert worker1_id == "worker-1"
+
+    worker2_thread = threading.Thread(
+        target=worker.run_worker,
+        args=("127.0.0.1", port),
+        kwargs={"worker_id": "worker-2"},
+        daemon=True,
+    )
+    worker2_thread.start()
+    conn2, worker2_id = master_server.accept_and_register(server_sock)
+    assert worker2_id == "worker-2"
+
+    connections = {worker1_id: conn1, worker2_id: conn2}
+
+    stop_event = threading.Event()
+    monitor_thread = threading.Thread(target=master_server.failure_monitor, args=(stop_event,), daemon=True)
+    monitor_started = False
+
+    try:
+        task1 = master_server.scheduler.submit_task("task-1", "ADD", {"a": 1, "b": 1})
+        task2 = master_server.scheduler.submit_task("task-2", "ADD", {"a": 2, "b": 2})
+
+        with master_server._state_lock:
+            master_server.scheduler.assign_task("task-1")
+            master_server.worker_manager.update_status("worker-1", WorkerStatus.IDLE)
+            master_server.scheduler.assign_task("task-2")
+            master_server.scheduler.start_task("task-1")
+            master_server.scheduler.start_task("task-2")
+
+        assert task1.assigned_worker_id == "worker-1"
+        assert task2.assigned_worker_id == "worker-1"
+        assert task1.attempt == 1
+        assert task2.attempt == 1
+
+        # Send both TASK messages sequentially from this one thread —
+        # dispatch_assigned_task would block waiting for a reply that never
+        # comes, and firing them from two threads on the same connection
+        # would risk their sendall() calls interleaving mid-message.
+        send_task_message(conn1, task1)
+        send_task_message(conn1, task2)
+
+        assert received_event.wait(timeout=5)
+
+        # Force staleness directly instead of waiting out a real heartbeat cycle.
+        master_server.worker_manager.get_worker("worker-1").last_heartbeat = time.time() - 10
+
+        monitor_thread.start()
+        monitor_started = True
+
+        deadline = time.monotonic() + 5
+        while (
+            master_server.worker_manager.get_worker("worker-1").status != WorkerStatus.FAILED
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+
+        assert master_server.worker_manager.get_worker("worker-1").status == WorkerStatus.FAILED
+        assert task1.status == TaskStatus.PENDING
+        assert task2.status == TaskStatus.PENDING
+        assert task1.assigned_worker_id is None
+        assert task2.assigned_worker_id is None
+
+        # worker-2 can only hold one task at a time, so drain_pending_tasks
+        # completes them one after another rather than both at once.
+        responses = master_server.drain_pending_tasks(connections)
+
+        assert len(responses) == 2
+        assert all(r["payload"]["status"] == "success" for r in responses)
+
+        assert task1.status == TaskStatus.COMPLETED
+        assert task2.status == TaskStatus.COMPLETED
+        assert task1.assigned_worker_id == "worker-2"
+        assert task2.assigned_worker_id == "worker-2"
+        assert task1.attempt == 2
+        assert task2.attempt == 2
+    finally:
+        stop_event.set()
+        if monitor_started:
+            monitor_thread.join(timeout=2)
+        for conn in connections.values():
+            conn.close()
+        server_sock.close()
+        worker1_thread.join(timeout=2)
+        worker2_thread.join(timeout=2)

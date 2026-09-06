@@ -34,3 +34,4 @@ class Task:
     payload: dict
     status: str = TaskStatus.PENDING
     assigned_worker_id: str | None = None
+    attempt: int = 0

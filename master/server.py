@@ -3,6 +3,7 @@
 import socket
 import threading
 
+from common.models import WorkerStatus
 from master import rpc_handler
 from master.scheduler import Scheduler
 from rpc import protocol
@@ -118,20 +119,32 @@ def heartbeat_listener(heartbeat_sock: socket.socket, stop_event: threading.Even
 
 def failure_monitor(stop_event: threading.Event) -> None:
     """Every FAILURE_CHECK_INTERVAL seconds, mark workers FAILED if they've
-    gone HEARTBEAT_TIMEOUT seconds without a heartbeat."""
+    gone HEARTBEAT_TIMEOUT seconds without a heartbeat, and requeue whatever
+    tasks they were running so another worker can pick them up.
+
+    Marking a worker FAILED and requeuing its tasks happens under
+    _state_lock as one atomic step — the same lock dispatch_assigned_task
+    uses — so a task can never be seen as both ASSIGNED-to-a-dead-worker
+    and PENDING at the same time from another thread's point of view.
+    """
     while not stop_event.wait(FAILURE_CHECK_INTERVAL):
-        stale_workers = worker_manager.get_stale_workers(HEARTBEAT_TIMEOUT)
+        with _state_lock:
+            stale_workers = worker_manager.get_stale_workers(HEARTBEAT_TIMEOUT)
 
-        for worker in stale_workers:
-            print(f"Worker failed: {worker.worker_id}")
+            for worker in stale_workers:
+                requeued_tasks = scheduler.requeue_tasks_for_worker(worker.worker_id)
+
+                print(f"Worker failed: {worker.worker_id}")
+                for task in requeued_tasks:
+                    print(f"Requeued task: {task.task_id}")
 
 
-def dispatch_task(conn: Connection, task_id: str, task_type: str, task_payload: dict) -> dict:
+def dispatch_task(conn: Connection, task_id: str, task_type: str, task_payload: dict, attempt: int = 1) -> dict:
     """Send a TASK request to a worker and return its decoded TASK_RESULT response."""
     request = build_message(
         protocol.TASK,
         request_id=f"task-{task_id}",
-        payload={"task_id": task_id, "task_type": task_type, "task_payload": task_payload},
+        payload={"task_id": task_id, "task_type": task_type, "task_payload": task_payload, "attempt": attempt},
     )
     print(f"RPC sent: {request['type']}")
     conn.send_bytes(protocol.encode_message(request))
@@ -149,22 +162,59 @@ def dispatch_assigned_task(connections: dict[str, Connection], task) -> dict:
     Safe to call from multiple threads at once, each with a different task:
     the network call runs unlocked (so workers genuinely run concurrently),
     and only the surrounding scheduler state changes are locked.
+
+    The worker_id and attempt are captured up front, before the blocking
+    network call. If the failure monitor requeues (and someone else later
+    reassigns) this same task while we're waiting on this worker's reply,
+    task.assigned_worker_id/task.attempt will have moved on by the time the
+    reply arrives — so a late result from a dead attempt can never overwrite
+    a newer one, even though both share the same underlying Task object.
     """
     conn = connections[task.assigned_worker_id]
+    worker_id = task.assigned_worker_id
+    attempt = task.attempt
 
     with _state_lock:
         scheduler.start_task(task.task_id)
 
-    response = dispatch_task(conn, task.task_id, task.task_type, task.payload)
+    def is_current_attempt() -> bool:
+        return task.assigned_worker_id == worker_id and task.attempt == attempt
+
+    try:
+        response = dispatch_task(conn, task.task_id, task.task_type, task.payload, attempt)
+    except (ConnectionError, OSError, ProtocolError) as exc:
+        # The worker died (or the connection otherwise broke) mid-dispatch —
+        # this is direct evidence of failure, just as strong as a heartbeat
+        # timeout, so it converges on the same recovery action: mark the
+        # worker FAILED and requeue its tasks for retry, not a terminal
+        # fail_task. That way it doesn't matter whether this connection-level
+        # detection or the heartbeat-based failure_monitor notices first —
+        # both paths land on "worker FAILED, task back to PENDING." Only do
+        # this if it's still the current attempt — if the failure monitor
+        # already requeued and reassigned this task while we were blocked
+        # here, this dead attempt must not touch the new one's state.
+        with _state_lock:
+            if is_current_attempt():
+                worker_manager.update_status(worker_id, WorkerStatus.FAILED)
+                scheduler.requeue_tasks_for_worker(worker_id)
+        return build_message(
+            protocol.ERROR,
+            f"task-{task.task_id}",
+            {"code": "WORKER_UNREACHABLE", "message": str(exc)},
+        )
 
     if response["type"] != protocol.TASK_RESULT:
         with _state_lock:
-            scheduler.fail_task(task.task_id)
+            if is_current_attempt():
+                scheduler.fail_task(task.task_id)
         return response
 
     result = response["payload"]
 
     with _state_lock:
+        if not is_current_attempt():
+            return response
+
         if result["status"] == "success":
             scheduler.complete_task(task.task_id)
         else:

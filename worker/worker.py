@@ -96,11 +96,16 @@ def serve_tasks(conn: Connection) -> None:
         task_id = task_payload["task_id"]
         task_type = task_payload["task_type"]
         task_args = task_payload["task_payload"]
+        attempt = task_payload.get("attempt", 1)
 
         result = execute_task(task_type, task_args)
-        print(f"Executed task {task_id}: {result}")
+        print(f"Executed task {task_id} (attempt {attempt}): {result}")
 
-        response = build_message(protocol.TASK_RESULT, request["request_id"], {"task_id": task_id, **result})
+        response = build_message(
+            protocol.TASK_RESULT,
+            request["request_id"],
+            {"task_id": task_id, "attempt": attempt, **result},
+        )
         conn.send_bytes(protocol.encode_message(response))
         print(f"Sent RPC: {protocol.TASK_RESULT}")
 
