@@ -60,6 +60,27 @@ def build_map_job(
     return tasks
 
 
+def _index_responses_by_task_id(responses: list[dict]) -> dict[str, dict]:
+    """Build a task_id -> response lookup, defensively.
+
+    Most responses are worker-produced TASK_RESULT payloads (always have
+    task_id/status). But dispatch_assigned_task can also hand back a
+    master-generated error -- e.g. WORKER_UNREACHABLE when a worker's
+    connection dies mid-dispatch -- and drain_pending_tasks' aggregate
+    response list can contain BOTH a dead attempt's error and a
+    successful retry's TASK_RESULT for the very same task_id in one call.
+    Building this with .get() (never direct indexing) means a response
+    that can't be identified is simply skipped rather than crashing the
+    whole collection -- its task just looks "missing" to the caller.
+    """
+    responses_by_task_id: dict[str, dict] = {}
+    for response in responses:
+        task_id = response.get("payload", {}).get("task_id")
+        if task_id is not None:
+            responses_by_task_id[task_id] = response
+    return responses_by_task_id
+
+
 def collect_map_results(tasks: list[Task], responses: list[dict]) -> list:
     """Reassemble the full mapped list from MAP task responses.
 
@@ -71,7 +92,7 @@ def collect_map_results(tasks: list[Task], responses: list[dict]) -> list:
 
     Raises ValueError if any task's response is missing or unsuccessful.
     """
-    responses_by_task_id = {response["payload"]["task_id"]: response for response in responses}
+    responses_by_task_id = _index_responses_by_task_id(responses)
 
     combined = []
     for task in tasks:
@@ -80,8 +101,8 @@ def collect_map_results(tasks: list[Task], responses: list[dict]) -> list:
             raise ValueError(f"No response received for task {task.task_id}")
 
         payload = response["payload"]
-        if payload["status"] != "success":
-            raise ValueError(f"Map task {task.task_id} failed: {payload.get('message')}")
+        if payload.get("status") != "success":
+            raise ValueError(f"Map task {task.task_id} failed: {payload.get('message') or payload.get('code')}")
 
         combined.extend(payload["result"])
 
@@ -100,7 +121,7 @@ def build_intermediate_results(job_id: str, tasks: list[Task], responses: list[d
     -- useful for inspecting a job's health, or for a later Shuffle/Reduce
     stage that needs structured input rather than a flat list.
     """
-    responses_by_task_id = {response["payload"]["task_id"]: response for response in responses}
+    responses_by_task_id = _index_responses_by_task_id(responses)
 
     results = []
     for partition_id, task in enumerate(tasks):
@@ -123,7 +144,7 @@ def build_intermediate_results(job_id: str, tasks: list[Task], responses: list[d
         payload = response["payload"]
         attempt = payload.get("attempt", task.attempt)
 
-        if payload["status"] == ResultStatus.SUCCESS:
+        if payload.get("status") == ResultStatus.SUCCESS:
             results.append(
                 IntermediateResult(
                     job_id=job_id,
@@ -142,7 +163,7 @@ def build_intermediate_results(job_id: str, tasks: list[Task], responses: list[d
                     partition_id=partition_id,
                     task_id=task.task_id,
                     status=ResultStatus.ERROR,
-                    message=payload.get("message"),
+                    message=payload.get("message") or payload.get("code"),
                     worker_id=task.assigned_worker_id,
                     attempt=attempt,
                 )

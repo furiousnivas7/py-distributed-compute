@@ -161,7 +161,9 @@ async def dispatch_assigned_task(task) -> dict:
     if link is None:
         mark_worker_failed_and_requeue()
         return build_message(
-            protocol.ERROR, f"task-{task.task_id}", {"code": "WORKER_UNREACHABLE", "message": "no connection"}
+            protocol.ERROR,
+            f"task-{task.task_id}",
+            {"task_id": task.task_id, "code": "WORKER_UNREACHABLE", "message": "no connection"},
         )
 
     try:
@@ -171,7 +173,9 @@ async def dispatch_assigned_task(task) -> dict:
         # heartbeat timeout, so it converges on the same recovery action.
         mark_worker_failed_and_requeue()
         return build_message(
-            protocol.ERROR, f"task-{task.task_id}", {"code": "WORKER_UNREACHABLE", "message": str(exc)}
+            protocol.ERROR,
+            f"task-{task.task_id}",
+            {"task_id": task.task_id, "code": "WORKER_UNREACHABLE", "message": str(exc)},
         )
 
     if response["type"] != protocol.TASK_RESULT:

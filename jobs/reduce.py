@@ -73,7 +73,20 @@ def collect_reduce_results(tasks: dict[str, Task], responses: list[dict]) -> dic
     with no indication anything went wrong, so Reduce failure must be
     explicit rather than tolerated like Shuffle's partial-failure handling.
     """
-    responses_by_task_id = {response["payload"]["task_id"]: response for response in responses}
+    # Most responses are worker-produced TASK_RESULT payloads (always have
+    # task_id/status). But dispatch_assigned_task can also hand back a
+    # master-generated error -- e.g. WORKER_UNREACHABLE when a worker's
+    # connection dies mid-dispatch -- and drain_pending_tasks' aggregate
+    # response list can contain BOTH a dead attempt's error and a
+    # successful retry's TASK_RESULT for the same task_id in one call.
+    # Building this with .get() (never direct indexing) means an
+    # unidentifiable response is simply skipped rather than crashing the
+    # whole collection -- its key just looks "missing" below.
+    responses_by_task_id: dict[str, dict] = {}
+    for response in responses:
+        task_id = response.get("payload", {}).get("task_id")
+        if task_id is not None:
+            responses_by_task_id[task_id] = response
 
     reduced = {}
     for key, task in tasks.items():
@@ -82,8 +95,8 @@ def collect_reduce_results(tasks: dict[str, Task], responses: list[dict]) -> dic
             raise ValueError(f"No response received for key {key!r} (task {task.task_id})")
 
         payload = response["payload"]
-        if payload["status"] != "success":
-            raise ValueError(f"Reduce for key {key!r} failed: {payload.get('message')}")
+        if payload.get("status") != "success":
+            raise ValueError(f"Reduce for key {key!r} failed: {payload.get('message') or payload.get('code')}")
 
         reduced[key] = payload["result"]
 

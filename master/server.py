@@ -200,7 +200,7 @@ def dispatch_assigned_task(connections: dict[str, Connection], task) -> dict:
         return build_message(
             protocol.ERROR,
             f"task-{task.task_id}",
-            {"code": "WORKER_UNREACHABLE", "message": str(exc)},
+            {"task_id": task.task_id, "code": "WORKER_UNREACHABLE", "message": str(exc)},
         )
 
     if response["type"] != protocol.TASK_RESULT:
