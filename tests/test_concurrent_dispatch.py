@@ -115,7 +115,7 @@ def test_two_concurrent_mapreduce_jobs_multiple_workers():
 
             job_a = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-a",
                 ["apple", "banana", "apple", "cherry", "banana", "apple"],
                 "WORD_COUNT",
@@ -124,7 +124,7 @@ def test_two_concurrent_mapreduce_jobs_multiple_workers():
             )
             job_b = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-b",
                 ["dog", "cat", "dog", "dog", "bird"],
                 "WORD_COUNT",
@@ -159,7 +159,7 @@ def test_multiple_concurrent_jobs_different_input_sizes():
 
             small = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "small",
                 ["solo"],
                 "WORD_COUNT",
@@ -168,7 +168,7 @@ def test_multiple_concurrent_jobs_different_input_sizes():
             )
             medium = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "medium",
                 ["x", "y", "x", "z", "y"],
                 "WORD_COUNT",
@@ -177,7 +177,7 @@ def test_multiple_concurrent_jobs_different_input_sizes():
             )
             large = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "large",
                 ["p"] * 5 + ["q"] * 4 + ["r"] * 3,
                 "WORD_COUNT",
@@ -215,7 +215,7 @@ def test_no_response_cross_contamination_between_jobs():
 
             job_a = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-a",
                 ["apple", "apple"],
                 "WORD_COUNT",
@@ -224,7 +224,7 @@ def test_no_response_cross_contamination_between_jobs():
             )
             job_b = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-b",
                 ["apple", "apple", "apple", "apple", "apple"],
                 "WORD_COUNT",
@@ -267,11 +267,11 @@ def test_concurrent_ordinary_tasks_and_a_mapreduce_job():
                 ordinary_ids.add(task.task_id)
 
             async def run_ordinary():
-                return await async_server.drain_tasks_for(ordinary_ids)
+                return await async_server.wait_for_tasks(ordinary_ids)
 
             mr_job = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-mr",
                 ["apple", "banana", "apple"],
                 "WORD_COUNT",
@@ -312,7 +312,7 @@ def test_concurrent_dispatch_with_worker_failure_in_one_job():
         try:
             job_a = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-a",
                 ["apple", "apple", "apple"],
                 "WORD_COUNT",
@@ -321,7 +321,7 @@ def test_concurrent_dispatch_with_worker_failure_in_one_job():
             )
             job_b = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-b",
                 ["kiwi", "kiwi"],
                 "WORD_COUNT",
@@ -362,7 +362,7 @@ def test_retry_response_arriving_after_another_job_has_started():
             job_a_task = asyncio.create_task(
                 run_map_reduce(
                     async_server.scheduler,
-                    async_server.drain_tasks_for,
+                    async_server.wait_for_tasks,
                     "job-a",
                     ["mango", "mango"],
                     "WORD_COUNT",
@@ -381,7 +381,7 @@ def test_retry_response_arriving_after_another_job_has_started():
             job_b_task = asyncio.create_task(
                 run_map_reduce(
                     async_server.scheduler,
-                    async_server.drain_tasks_for,
+                    async_server.wait_for_tasks,
                     "job-b",
                     ["pear", "pear", "pear"],
                     "WORD_COUNT",
@@ -423,7 +423,7 @@ def test_stale_response_not_returned_to_wrong_caller():
             job_a_task = asyncio.create_task(
                 run_map_reduce(
                     async_server.scheduler,
-                    async_server.drain_tasks_for,
+                    async_server.wait_for_tasks,
                     "job-a",
                     ["grape"],
                     "WORD_COUNT",
@@ -443,7 +443,7 @@ def test_stale_response_not_returned_to_wrong_caller():
             job_b_task = asyncio.create_task(
                 run_map_reduce(
                     async_server.scheduler,
-                    async_server.drain_tasks_for,
+                    async_server.wait_for_tasks,
                     "job-b",
                     ["lemon", "lime", "lemon"],
                     "WORD_COUNT",
@@ -493,7 +493,7 @@ def test_repeated_concurrent_execution_detects_intermittent_failures():
 
             job_a = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 f"job-a-{iteration}",
                 ["red", "blue", "red"],
                 "WORD_COUNT",
@@ -502,7 +502,7 @@ def test_repeated_concurrent_execution_detects_intermittent_failures():
             )
             job_b = run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 f"job-b-{iteration}",
                 ["green", "green", "green", "yellow"],
                 "WORD_COUNT",

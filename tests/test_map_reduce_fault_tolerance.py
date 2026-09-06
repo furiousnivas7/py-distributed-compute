@@ -188,7 +188,7 @@ def test_map_task_retries_after_failure():
         try:
             result = await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-1",
                 WORDS,
                 "WORD_COUNT",
@@ -230,7 +230,7 @@ def test_reduce_task_retries_after_failure():
             # either worker; run_map_reduce's own retry handles it either way.
             result = await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-1",
                 ["apple", "apple", "apple"],
                 "WORD_COUNT",
@@ -707,7 +707,7 @@ def test_full_map_reduce_recovers_from_worker_failure():
         try:
             return await run_map_reduce(
                 async_server.scheduler,
-                async_server.drain_tasks_for,
+                async_server.wait_for_tasks,
                 "job-1",
                 WORDS,
                 "WORD_COUNT",

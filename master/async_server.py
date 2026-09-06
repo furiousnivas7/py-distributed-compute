@@ -40,6 +40,55 @@ scheduler = Scheduler(worker_manager)
 # worker_id -> WorkerLink, populated once a connection's REGISTER succeeds.
 connections: dict[str, "WorkerLink"] = {}
 
+# Phase 8.9 -- centralized task ownership and response routing.
+#
+# Every dispatch, regardless of which code path triggered it (the legacy
+# drain_pending_tasks()/drain_tasks_for() loops, a test calling
+# dispatch_assigned_task() directly, or the dispatcher_loop below), writes
+# its task's terminal outcome here exactly once. Keyed by task_id, so any
+# caller can retrieve or await a specific task's result without needing to
+# be the one that happened to dispatch it -- this is what makes
+# wait_for_tasks() safe for concurrent callers without job-scoping the
+# assignment step at all (contrast with drain_tasks_for()'s task_ids
+# filter, Phase 8.8's fix, which is still available and still used by
+# tests that call it directly).
+_task_responses: dict[str, dict] = {}
+_task_futures: dict[str, asyncio.Future] = {}
+
+_dispatcher_task: asyncio.Task | None = None
+_dispatcher_stop_event: asyncio.Event | None = None
+_dispatcher_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _record_task_response(task_id: str, response: dict) -> None:
+    """Record a task's terminal outcome and resolve anyone awaiting it.
+
+    Response payloads always carry the attempt that produced them
+    (`payload["attempt"]`), so even though this registry is keyed by
+    task_id alone -- a caller wants "the final answer for this task",
+    not "attempt N's answer" -- which attempt actually won is never lost.
+    """
+    _task_responses[task_id] = response
+    future = _task_futures.get(task_id)
+    if future is not None and not future.done():
+        future.set_result(response)
+
+
+def clear_dispatch_registry() -> None:
+    """Reset the response registry and any pending futures.
+
+    Module-level state, exactly like rpc_handler.worker_manager and this
+    module's own `scheduler` -- tests must clear it between runs (see
+    tests/conftest.py) or a stale, already-resolved response left over
+    from an earlier test reusing the same task_id could resolve a later,
+    unrelated wait_for_tasks() call immediately with the wrong data.
+    """
+    _task_responses.clear()
+    for future in _task_futures.values():
+        if not future.done():
+            future.cancel()
+    _task_futures.clear()
+
 
 class WorkerLink:
     """Owns the single read loop for one worker's persistent connection.
@@ -153,34 +202,55 @@ async def dispatch_assigned_task(task) -> dict:
     def is_current_attempt() -> bool:
         return task.assigned_worker_id == worker_id and task.attempt == attempt
 
-    def mark_worker_failed_and_requeue() -> None:
-        if is_current_attempt():
+    def record_if_terminal(response: dict, was_current: bool) -> None:
+        # Only the call whose (worker_id, attempt) still matched the
+        # task's state at the moment it detected the failure/result gets to
+        # decide whether that state is terminal -- a stale/late call for an
+        # attempt that's since moved on must never overwrite what a later,
+        # winning attempt already recorded. `was_current` must be captured
+        # BEFORE any mutation (e.g. mark_worker_failed_and_requeue, below)
+        # that could itself flip is_current_attempt() -- re-checking it
+        # AFTER such a mutation would make this call look "stale" against
+        # state it just changed itself, even though nothing else ran.
+        if was_current and task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            _record_task_response(task.task_id, response)
+
+    def mark_worker_failed_and_requeue(was_current: bool) -> None:
+        if was_current:
             worker_manager.update_status(worker_id, WorkerStatus.FAILED)
             scheduler.requeue_tasks_for_worker(worker_id)
 
     if link is None:
-        mark_worker_failed_and_requeue()
-        return build_message(
+        was_current = is_current_attempt()
+        mark_worker_failed_and_requeue(was_current)
+        response = build_message(
             protocol.ERROR,
             f"task-{task.task_id}",
-            {"task_id": task.task_id, "code": "WORKER_UNREACHABLE", "message": "no connection"},
+            {"task_id": task.task_id, "attempt": attempt, "code": "WORKER_UNREACHABLE", "message": "no connection"},
         )
+        record_if_terminal(response, was_current)
+        return response
 
     try:
         response = await link.send_task(task.task_id, task.task_type, task.payload, attempt)
     except (ConnectionError, ProtocolError) as exc:
         # Worker died mid-dispatch -- as strong a failure signal as a
         # heartbeat timeout, so it converges on the same recovery action.
-        mark_worker_failed_and_requeue()
-        return build_message(
+        was_current = is_current_attempt()
+        mark_worker_failed_and_requeue(was_current)
+        response = build_message(
             protocol.ERROR,
             f"task-{task.task_id}",
-            {"task_id": task.task_id, "code": "WORKER_UNREACHABLE", "message": str(exc)},
+            {"task_id": task.task_id, "attempt": attempt, "code": "WORKER_UNREACHABLE", "message": str(exc)},
         )
+        record_if_terminal(response, was_current)
+        return response
 
     if response["type"] != protocol.TASK_RESULT:
-        if is_current_attempt():
+        was_current = is_current_attempt()
+        if was_current:
             scheduler.fail_task(task.task_id)
+        record_if_terminal(response, was_current)
         return response
 
     if not is_current_attempt():
@@ -192,6 +262,7 @@ async def dispatch_assigned_task(task) -> dict:
     else:
         scheduler.fail_task(task.task_id)
 
+    record_if_terminal(response, True)
     return response
 
 
@@ -292,10 +363,137 @@ async def drain_pending_tasks() -> list[dict]:
     return await drain_tasks_for(None)
 
 
+async def dispatcher_loop(stop_event: asyncio.Event, poll_interval: float = 0.01) -> None:
+    """The single authoritative loop for assigning PENDING tasks to IDLE
+    workers and dispatching them, once started (see ensure_dispatcher_running).
+
+    Unlike drain_tasks_for(), this never stops on its own and needs no
+    task_ids scope: since it's the ONLY thing that ever calls
+    scheduler.assign_next_pending_task() while it's running, there's no
+    other caller left to race with over who gets to assign a given
+    PENDING task -- every task, regardless of who submitted it, is
+    eventually picked up by this same loop, and every dispatch's outcome
+    lands in the shared _task_responses registry (see
+    dispatch_assigned_task's record_if_terminal), addressable by any
+    caller via wait_for_tasks() regardless of dispatch timing.
+
+    Each dispatch runs as its own background task so a slow/stuck worker
+    never blocks this loop from noticing and assigning other pending work.
+    """
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        while True:
+            task = scheduler.assign_next_pending_task()
+            if task is None:
+                break
+            asyncio.create_task(dispatch_assigned_task(task))
+
+
+def is_dispatcher_running() -> bool:
+    """Whether the centralized dispatcher is active on the CURRENT event loop.
+
+    Each test (and run_server()) runs its own asyncio.run(), so a
+    dispatcher task created by an earlier loop is meaningless here --
+    comparing against the loop it was actually created on is what makes
+    this safe to call from a fresh loop without confusing a stale
+    reference for "still running".
+    """
+    return (
+        _dispatcher_task is not None
+        and _dispatcher_event_loop is asyncio.get_running_loop()
+        and not _dispatcher_task.done()
+    )
+
+
+def ensure_dispatcher_running() -> None:
+    """Idempotently start the centralized dispatcher on the current event
+    loop. Safe to call repeatedly (wait_for_tasks() calls this itself) --
+    a no-op if it's already running here."""
+    global _dispatcher_task, _dispatcher_stop_event, _dispatcher_event_loop
+    if is_dispatcher_running():
+        return
+    _dispatcher_stop_event = asyncio.Event()
+    _dispatcher_event_loop = asyncio.get_running_loop()
+    _dispatcher_task = asyncio.create_task(dispatcher_loop(_dispatcher_stop_event))
+
+
+async def stop_dispatcher() -> None:
+    """Stop the dispatcher started by ensure_dispatcher_running(), if any is running here."""
+    global _dispatcher_task
+    if not is_dispatcher_running():
+        return
+    _dispatcher_stop_event.set()
+    await _dispatcher_task
+    _dispatcher_task = None
+
+
+async def wait_for_tasks(task_ids: set[str], timeout: float = 30.0) -> list[dict]:
+    """Wait for every task in `task_ids` to reach a terminal state and
+    return their responses (order matches iteration of `task_ids`, not
+    completion order -- callers that care about a specific order, like
+    jobs.map's partition order, already re-sort by task_id themselves).
+
+    Starts the centralized dispatcher if it isn't already running, then
+    relies entirely on it to actually assign and dispatch these tasks --
+    this function itself never calls assign_next_pending_task or
+    dispatch_assigned_task. That's what makes it safe for any number of
+    concurrent callers (multiple MapReduce jobs, ordinary ad-hoc tasks,
+    and the failure monitor's recovery work all resolve through the same
+    dispatcher and the same _task_responses registry): there is no
+    caller-specific response list for a response to go missing from.
+    """
+    ensure_dispatcher_running()
+
+    responses: dict[str, dict] = {}
+    pending_ids = []
+    for task_id in task_ids:
+        if task_id in _task_responses:
+            responses[task_id] = _task_responses[task_id]
+        else:
+            pending_ids.append(task_id)
+
+    if pending_ids:
+        futures = []
+        for task_id in pending_ids:
+            future = _task_futures.get(task_id)
+            if future is None or future.done():
+                future = asyncio.get_running_loop().create_future()
+                _task_futures[task_id] = future
+            futures.append(future)
+
+        results = await asyncio.wait_for(asyncio.gather(*futures), timeout=timeout)
+        for task_id, result in zip(pending_ids, results):
+            responses[task_id] = result
+
+    return [responses[task_id] for task_id in task_ids]
+
+
 async def failure_monitor(stop_event: asyncio.Event) -> None:
     """Every FAILURE_CHECK_INTERVAL seconds, mark workers FAILED if they've
     gone HEARTBEAT_TIMEOUT seconds without a heartbeat, requeue their tasks,
-    and try to hand those tasks to whoever's still idle."""
+    and make sure something will pick those tasks back up.
+
+    If the centralized dispatcher (see dispatcher_loop) is already running,
+    this deliberately does NOT dispatch anything itself -- the dispatcher
+    will assign the newly-PENDING tasks on its own very next tick, and
+    dispatching them here too would recreate exactly the race Phase 8.8
+    fixed (two independent callers competing over the same scheduler,
+    one's response landing in the other's discarded result). This is what
+    "the failure monitor submits recovery work to the dispatcher rather
+    than independently draining tasks" means in practice: it does nothing
+    beyond requeuing once a dispatcher exists to notice.
+
+    When no dispatcher is running (every test and code path predating
+    Phase 8.9, which drives dispatch manually or via drain_pending_tasks/
+    drain_tasks_for), this falls back to the original behavior so that
+    existing recovery tests keep working without needing to adopt the
+    dispatcher.
+    """
     while True:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=FAILURE_CHECK_INTERVAL)
@@ -312,6 +510,9 @@ async def failure_monitor(stop_event: asyncio.Event) -> None:
             print(f"Worker failed: {worker.worker_id}")
             for task in requeued_tasks:
                 print(f"Requeued task: {task.task_id}")
+
+        if is_dispatcher_running():
+            continue
 
         await drain_pending_tasks()
 
