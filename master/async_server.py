@@ -10,6 +10,48 @@ implementation needed a second port and a dedicated heartbeat-listener
 thread specifically to avoid two OS threads calling recv() on the same
 socket; asyncio has exactly one coroutine reading a given connection at a
 time by construction, so that whole problem doesn't exist here.
+
+DISPATCH CONTRACT (Phase 8.9)
+------------------------------
+This module has exactly one PUBLIC, concurrency-safe way to run tasks and
+get their results:
+
+    submit task(s) via scheduler.submit_task(...)
+                  |
+                  v
+         wait_for_tasks(task_ids)   <-- the only supported entry point
+                  |
+                  v
+    ensure_dispatcher_running()  (idempotent, starts dispatcher_loop)
+                  |
+                  v
+             dispatcher_loop        <-- the ONLY caller of
+                  |                     scheduler.assign_next_pending_task()
+                  v                     once it's running
+              scheduler
+                  |
+                  v
+           dispatch_assigned_task    <-- records into the response
+                  |                      registry (record_if_terminal)
+                  v
+                worker
+
+Everything below `dispatch_assigned_task` in that diagram (scheduler,
+worker links, the response registry) is internal machinery. New
+production code that needs to run tasks and wait for results should call
+`wait_for_tasks` and nothing else in this module.
+
+`drain_tasks_for` / `drain_pending_tasks` are LEGACY: they predate the
+centralized dispatcher and run their own independent assign-and-dispatch
+loop directly against the shared scheduler. They are kept only because a
+large share of the pre-8.9 test suite drives dispatch manually (submit a
+task, then call one of these to pump it through) and depends on that
+precise manual control -- an always-on dispatcher would race with it.
+They remain exactly as unsafe for concurrent callers as they always were
+(see drain_tasks_for's own docstring) and must not be used by new
+production code, or by two callers at once. Do not build new features on
+top of them; migrate a call site off them entirely rather than adding to
+it.
 """
 
 import asyncio
@@ -267,7 +309,13 @@ async def dispatch_assigned_task(task) -> dict:
 
 
 async def drain_tasks_for(task_ids: set[str] | None, poll_interval: float = 0.01, timeout: float = 30.0) -> list[dict]:
-    """Repeatedly assign and dispatch PENDING tasks to IDLE workers until none remain.
+    """LEGACY / TEST-ONLY -- see the module docstring's "DISPATCH CONTRACT"
+    section. Predates the Phase 8.9 centralized dispatcher; new production
+    code must use wait_for_tasks() instead. Kept only because a large share
+    of the pre-8.9 test suite depends on driving dispatch this way. Do not
+    add new callers.
+
+    Repeatedly assign and dispatch PENDING tasks to IDLE workers until none remain.
 
     Each round assigns one task per currently-IDLE worker (pure in-memory,
     synchronous, no await) before dispatching that whole round concurrently
@@ -351,14 +399,17 @@ async def drain_tasks_for(task_ids: set[str] | None, poll_interval: float = 0.01
 
 
 async def drain_pending_tasks() -> list[dict]:
-    """Drain every currently-PENDING task, regardless of who submitted it.
+    """LEGACY / TEST-ONLY -- see the module docstring's "DISPATCH CONTRACT"
+    section and drain_tasks_for()'s docstring. New production code must use
+    wait_for_tasks() instead (run_server()'s demo already does).
 
-    Kept for backward compatibility (run_server()'s demo, failure_monitor's
-    own opportunistic sweep, and any test driving a single job/worker set
-    in isolation) -- but NOT safe to call from multiple concurrent callers.
-    See drain_tasks_for()'s docstring for why, and use it with an explicit
-    task_ids scope instead whenever more than one caller may be dispatching
-    at the same time (e.g. jobs.map_reduce.run_map_reduce).
+    Drain every currently-PENDING task, regardless of who submitted it.
+    Kept for backward compatibility (failure_monitor's pre-8.9 fallback
+    sweep, and any test driving a single job/worker set in isolation) --
+    but NOT safe to call from multiple concurrent callers. Use
+    wait_for_tasks() (or, in a test that must drive dispatch manually,
+    drain_tasks_for() with an explicit task_ids scope) instead whenever
+    more than one caller may be dispatching at the same time.
     """
     return await drain_tasks_for(None)
 
@@ -539,10 +590,13 @@ async def run_server() -> None:
             ("task-3", "ADD", {"a": 5, "b": 5}),
             ("task-4", "MULTIPLY", {"a": 2, "b": 2}),
         ]
+        task_ids = set()
         for task_id, task_type, task_payload in demo_tasks:
             scheduler.submit_task(task_id, task_type, task_payload)
+            task_ids.add(task_id)
 
-        await drain_pending_tasks()
+        await wait_for_tasks(task_ids)
+        await stop_dispatcher()
 
         print("Final task states:")
         for task in scheduler.get_all_tasks():

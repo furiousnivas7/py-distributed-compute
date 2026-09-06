@@ -11,19 +11,26 @@ list, leaving the task's rightful caller thinking it was never dispatched
 at all (test_map_reduce.py's original 8.6 job-isolation test demonstrated
 exactly this and had to be downgraded to sequential execution).
 
-The fix: master.async_server.drain_tasks_for(task_ids) scopes assignment
-to a specific set of task_ids (master.scheduler.assign_next_pending_task
-grew a matching optional filter). jobs.map_reduce.run_map_reduce now calls
-dispatch(task_ids) with its own task_ids for each phase, so two concurrent
-run_map_reduce() calls -- or a job running alongside ordinary tasks -- never
-compete for the same task and their response lists can never cross-
-contaminate. No lock is needed: individual Scheduler/WorkerManager calls
-are already atomic (no `await` inside them), and disjoint task_id sets
-mean concurrent callers have nothing left to race over.
+The 8.8 fix: master.async_server.drain_tasks_for(task_ids) scoped
+assignment to a specific set of task_ids (master.scheduler.
+assign_next_pending_task grew a matching optional filter), so two
+concurrent run_map_reduce() calls -- or a job running alongside ordinary
+tasks -- no longer compete for the same task. drain_tasks_for/
+drain_pending_tasks (unscoped) still exist and are still not safe for
+concurrent callers on their own, but they're LEGACY as of Phase 8.9 (see
+master/async_server.py's module docstring, "DISPATCH CONTRACT") -- kept
+for the pre-8.9 tests that depend on driving dispatch manually, not for
+new production code.
 
-drain_pending_tasks() (unscoped) remains available and is still not safe
-for concurrent callers -- it's for the single-caller case only (the manual
-demo in run_server(), or a test driving one job/worker set in isolation).
+The tests below have since been switched to Phase 8.9's
+wait_for_tasks(task_ids), which gets the same job-isolation guarantee
+through the centralized dispatcher + task_id-keyed response registry
+instead of each caller running its own scoped assignment loop -- but the
+scenarios themselves (the actual concurrency hazards being guarded
+against) are unchanged from Phase 8.8, which is why this file still
+documents that root cause. See tests/test_centralized_dispatcher.py for
+tests specific to the dispatcher/registry architecture itself (lifecycle,
+duplicate/late responses, retry exhaustion).
 
 Every test here verifies EXACT results, not just "completed without error".
 """
