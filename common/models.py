@@ -25,6 +25,14 @@ class Worker:
     port: int
     status: str = WorkerStatus.REGISTERED
     last_heartbeat: float | None = None
+    # Bumped each time this worker_id successfully re-registers after being
+    # marked FAILED (see WorkerManager.register_worker). worker_id alone is
+    # a stable LOGICAL identity; generation distinguishes which physical
+    # connection currently owns it, so state belonging to a superseded
+    # connection can be told apart from the current one. See
+    # master/async_server.py's handle_worker_connection for how the
+    # connection layer enforces this.
+    generation: int = 1
 
 
 @dataclass

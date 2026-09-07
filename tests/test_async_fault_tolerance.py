@@ -197,18 +197,19 @@ def test_no_false_failure_when_heartbeats_continue(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_reconnection_with_same_worker_id_after_failure_is_currently_rejected():
-    """Documents a real, current limitation rather than papering over it:
-    once a worker_id is marked FAILED, nothing lets it re-register. A new
-    connection claiming the same worker_id is rejected as a duplicate.
-    Reconnection support is intentionally out of scope for this phase."""
+def test_reconnection_with_same_worker_id_while_active_is_still_rejected():
+    """A worker_id that's still REGISTERED/IDLE/BUSY (a live connection is
+    actually representing it) rejects a second registration attempt as a
+    genuine conflict, not a reconnect -- unchanged by Phase 9.2.1, which
+    only allows re-registration once the existing entry is FAILED (see
+    test_reconnection_with_same_worker_id_after_failure_succeeds_with_new_generation)."""
 
     async def scenario():
         server, host, port = await start_master_server()
         worker_task = asyncio.create_task(async_worker.run_worker(host, port, worker_id="worker-1"))
         try:
             await async_server.wait_for_workers(1)
-            async_server.worker_manager.update_status("worker-1", WorkerStatus.FAILED)
+            assert async_server.worker_manager.get_worker("worker-1").status == WorkerStatus.IDLE
 
             reader, writer = await asyncio.open_connection(host, port)
             conn = AsyncConnection(reader, writer)
@@ -227,6 +228,63 @@ def test_reconnection_with_same_worker_id_after_failure_is_currently_rejected():
     response = asyncio.run(scenario())
     assert response["type"] == protocol.ERROR
     assert response["payload"]["code"] == "DUPLICATE_WORKER"
+
+
+def test_reconnection_with_same_worker_id_after_failure_succeeds_with_new_generation():
+    """Phase 9.2.1: once a worker_id is marked FAILED, a new connection
+    claiming that same worker_id may re-register -- this is worker
+    recovery, not a duplicate-registration conflict. The new registration
+    gets a bumped generation, and the OLD connection (still technically
+    alive here -- forcing FAILED via update_status doesn't itself kill the
+    real worker's TCP connection, exactly the scenario that matters) is
+    proactively invalidated by the master: closed outright, so it can
+    never again mutate state on behalf of what's now a superseded
+    generation (a stale heartbeat refreshing the NEW generation's
+    last_heartbeat, for instance)."""
+
+    async def scenario():
+        server, host, port = await start_master_server()
+        worker_task = asyncio.create_task(async_worker.run_worker(host, port, worker_id="worker-1"))
+        try:
+            await async_server.wait_for_workers(1)
+            old_link = async_server.connections["worker-1"]
+            assert old_link.generation == 1
+
+            async_server.worker_manager.update_status("worker-1", WorkerStatus.FAILED)
+
+            reader, writer = await asyncio.open_connection(host, port)
+            conn = AsyncConnection(reader, writer)
+            try:
+                await send_request(conn, protocol.PING)
+                response = await send_request(
+                    conn, protocol.REGISTER, {"worker_id": "worker-1", "host": "127.0.0.1", "port": 6002}
+                )
+
+                worker = async_server.worker_manager.get_worker("worker-1")
+                assert worker.status == WorkerStatus.IDLE
+                assert worker.generation == 2
+                assert worker.port == 6002
+
+                new_link = async_server.connections["worker-1"]
+                assert new_link is not old_link
+                assert new_link.generation == 2
+
+                # The old connection must have been actually closed by the
+                # master, not just superseded in bookkeeping -- proven by
+                # its own read now failing.
+                with pytest.raises(ConnectionError):
+                    await receive_message(old_link.conn)
+
+                return response
+            finally:
+                await conn.close()
+        finally:
+            await stop_worker(worker_task)
+            server.close()
+            await server.wait_closed()
+
+    response = asyncio.run(scenario())
+    assert response["type"] == protocol.REGISTER_ACK
 
 
 def test_multiple_tasks_requeued_when_worker_fails(monkeypatch):

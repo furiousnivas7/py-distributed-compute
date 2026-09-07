@@ -171,11 +171,22 @@ class WorkerLink:
     connection's one read loop (see handle_worker_connection) resolves it
     when the matching reply shows up, or fails every pending Future if the
     connection dies first.
+
+    `generation` is set once, right after this connection's REGISTER
+    succeeds (see handle_worker_connection), to whatever generation
+    WorkerManager.register_worker assigned -- purely for observability
+    (logging, assertions, a future caller that wants to know which
+    physical connection is currently authoritative for a worker_id). It
+    plays no role in correctness by itself: connection-identity comparison
+    (`connections.get(worker_id) is link`) is what actually decides
+    whether a given connection is still current, since that's the same
+    dict every code path already consults.
     """
 
     def __init__(self, conn: AsyncConnection):
         self.conn = conn
         self._pending: dict[str, asyncio.Future] = {}
+        self.generation: int | None = None
 
     async def send_task(self, task_id: str, task_type: str, task_payload: dict, attempt: int) -> dict:
         request_id = attempt_request_id(task_id, attempt)
@@ -217,6 +228,21 @@ async def handle_worker_connection(reader: asyncio.StreamReader, writer: asyncio
     rpc_handler.handle_request and replied to inline -- exactly like the
     synchronous master's per-connection loop, just without needing a
     separate phase for "registration" vs. "everything after."
+
+    Connection generations (Phase 9.2.1): a worker_id that's currently
+    FAILED is allowed to re-register (see WorkerManager.register_worker),
+    which is how a worker recovers and rejoins after a crash/restart. When
+    that happens on a DIFFERENT connection than the one `connections`
+    currently has for that worker_id (the normal case -- the old
+    connection already disconnected and this is a fresh one), the old
+    connection is proactively closed here. That's what makes "an old
+    connection must not be able to mutate state belonging to a newer
+    generation" a hard guarantee rather than a hope: closing it means its
+    own read loop (in whatever coroutine is still running it, if any) gets
+    ConnectionError on its very next read and exits through this same
+    `finally` block -- which only pops `connections[worker_id]` if IT is
+    still the current entry, so a belated cleanup from the old connection
+    can never clobber the new one that's since taken its place.
     """
     conn = AsyncConnection(reader, writer)
     link = WorkerLink(conn)
@@ -242,9 +268,13 @@ async def handle_worker_connection(reader: asyncio.StreamReader, writer: asyncio
 
             if message["type"] == protocol.REGISTER and response["type"] == protocol.REGISTER_ACK:
                 worker_id = message["payload"]["worker_id"]
+                link.generation = worker_manager.get_worker(worker_id).generation
+                previous_link = connections.get(worker_id)
                 connections[worker_id] = link
+                if previous_link is not None and previous_link is not link:
+                    await previous_link.conn.close()
     finally:
-        if worker_id is not None:
+        if worker_id is not None and connections.get(worker_id) is link:
             connections.pop(worker_id, None)
         link.fail_pending(ConnectionError("Worker connection closed"))
         await conn.close()

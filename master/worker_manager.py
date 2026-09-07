@@ -29,6 +29,22 @@ class WorkerManager:
         return worker_id in self._workers
 
     def register_worker(self, worker_id: str, host: str, port: int) -> Worker:
+        """Register worker_id, or -- if it already exists and is FAILED --
+        replace it in place with a new generation (see Worker.generation).
+
+        worker_id is a stable LOGICAL identity a worker keeps across
+        reconnects; generation identifies which physical connection
+        currently speaks for it. Replacement is only allowed once the
+        existing entry is FAILED: a worker_id that's REGISTERED/IDLE/BUSY
+        still has a live connection actively representing it, so a second
+        registration attempt for it is a genuine conflict (still rejected
+        as DuplicateWorkerError, unchanged from before) rather than a
+        legitimate reconnect. Bumping generation rather than replacing the
+        Worker object outright keeps every existing get_worker() reference
+        (and the object identity tests may hold onto) pointing at the
+        current state, matching how Task/Worker are mutated in place
+        everywhere else in this codebase.
+        """
         if not isinstance(worker_id, str) or not worker_id:
             raise ValueError("worker_id must be a non-empty string")
         if not isinstance(host, str) or not host:
@@ -36,8 +52,17 @@ class WorkerManager:
         if not isinstance(port, int) or isinstance(port, bool) or not (0 < port < 65536):
             raise ValueError("port must be a valid TCP port number")
 
-        if self.has_worker(worker_id):
-            raise DuplicateWorkerError(f"Worker already registered: {worker_id}")
+        existing = self._workers.get(worker_id)
+        if existing is not None:
+            if existing.status != WorkerStatus.FAILED:
+                raise DuplicateWorkerError(f"Worker already registered: {worker_id}")
+
+            existing.host = host
+            existing.port = port
+            existing.status = WorkerStatus.IDLE
+            existing.last_heartbeat = time.time()
+            existing.generation += 1
+            return existing
 
         worker = Worker(
             worker_id=worker_id,
@@ -45,6 +70,7 @@ class WorkerManager:
             port=port,
             status=WorkerStatus.IDLE,
             last_heartbeat=time.time(),
+            generation=1,
         )
         self._workers[worker_id] = worker
         return worker

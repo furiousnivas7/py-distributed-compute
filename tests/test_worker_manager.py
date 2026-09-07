@@ -37,6 +37,60 @@ def test_register_duplicate_id_raises(manager):
         manager.register_worker("worker-1", "127.0.0.1", 6002)
 
 
+def test_register_new_worker_starts_at_generation_one(manager):
+    worker = manager.register_worker("worker-1", "127.0.0.1", 6001)
+    assert worker.generation == 1
+
+
+def test_register_duplicate_id_raises_regardless_of_status(manager):
+    """REGISTERED, IDLE, and BUSY all represent a live connection actively
+    speaking for that worker_id -- only FAILED allows replacement."""
+    for status in (WorkerStatus.REGISTERED, WorkerStatus.IDLE, WorkerStatus.BUSY):
+        manager.clear()
+        manager.register_worker("worker-1", "127.0.0.1", 6001)
+        manager.update_status("worker-1", status)
+        with pytest.raises(DuplicateWorkerError):
+            manager.register_worker("worker-1", "127.0.0.1", 6002)
+
+
+def test_register_after_failure_replaces_in_place_with_bumped_generation(manager):
+    """A FAILED worker_id may re-register (worker recovery/replacement,
+    Phase 9.2.1) -- not a conflict. The SAME Worker object is mutated in
+    place (matching how Task/Worker are updated everywhere else in this
+    codebase) rather than replaced, so any earlier get_worker() reference
+    observes the new state too; only `generation` distinguishes old from
+    new."""
+    first = manager.register_worker("worker-1", "127.0.0.1", 6001)
+    manager.update_status("worker-1", WorkerStatus.FAILED)
+
+    second = manager.register_worker("worker-1", "127.0.0.1", 6002)
+
+    assert second is first
+    assert second.status == WorkerStatus.IDLE
+    assert second.port == 6002
+    assert second.generation == 2
+    assert manager.get_worker("worker-1").generation == 2
+
+
+def test_register_after_failure_refreshes_last_heartbeat(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    manager.update_status("worker-1", WorkerStatus.FAILED)
+    stale_time = time.time() - 100
+    manager.get_worker("worker-1").last_heartbeat = stale_time
+
+    manager.register_worker("worker-1", "127.0.0.1", 6002)
+
+    assert manager.get_worker("worker-1").last_heartbeat > stale_time
+
+
+def test_register_after_failure_repeated_replacement_keeps_bumping_generation(manager):
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    for expected_generation in (2, 3, 4):
+        manager.update_status("worker-1", WorkerStatus.FAILED)
+        worker = manager.register_worker("worker-1", "127.0.0.1", 6001)
+        assert worker.generation == expected_generation
+
+
 def test_list_workers(manager):
     manager.register_worker("worker-1", "127.0.0.1", 6001)
     manager.register_worker("worker-2", "127.0.0.1", 6002)
