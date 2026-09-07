@@ -262,9 +262,18 @@ def test_stale_result_cannot_overwrite_newer_attempt_after_delay(monkeypatch):
     """The connection never dies here -- worker-1 just never heartbeats and
     holds its reply. The failure monitor reassigns to worker-2, which
     completes the task, and ONLY THEN does worker-1's stale attempt-1 reply
-    finally arrive on its still-open connection. It must be ignored."""
+    finally arrive on its still-open connection. It must be ignored.
+
+    Margin note: worker-2's heartbeat_interval was widened from 0.05 to
+    0.1 against a HEARTBEAT_TIMEOUT raised from 0.3 to 1.0 (a 10x margin,
+    matching every other test in this file that has never been observed
+    to flake). At the original 6x margin, a repro loop of 150 back-to-back
+    runs (Phase 9.1 follow-up) caught worker-2 itself occasionally getting
+    spuriously marked FAILED under real system load -- a single delayed
+    heartbeat past 250ms was enough -- which left zero IDLE workers to
+    reassign the requeued task to, so it stayed PENDING forever."""
     monkeypatch.setattr(async_server, "FAILURE_CHECK_INTERVAL", 0.05)
-    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 0.3)
+    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 1.0)
 
     async def scenario():
         server, host, port = await start_master_server()
@@ -274,7 +283,7 @@ def test_stale_result_cannot_overwrite_newer_attempt_after_delay(monkeypatch):
         worker1_task = asyncio.create_task(run_delayed_reply_worker(host, port, "worker-1", ready, release))
         await async_server.wait_for_workers(1)
         worker2_task = asyncio.create_task(
-            async_worker.run_worker(host, port, worker_id="worker-2", heartbeat_interval=0.05)
+            async_worker.run_worker(host, port, worker_id="worker-2", heartbeat_interval=0.1)
         )
         await async_server.wait_for_workers(2)
 
@@ -408,10 +417,23 @@ def test_retry_exhaustion_leaves_a_spare_idle_worker_untouched(monkeypatch):
     """Same exhaustion guarantee as test_async_fault_tolerance.py's version,
     but this time a 4th worker sits IDLE the whole time -- proving that
     once a task is FAILED (exhausted), it's never assigned again even
-    though an available worker exists to take it."""
+    though an available worker exists to take it.
+
+    Timing note: HEARTBEAT_TIMEOUT is 5.0 here (not the usual 1.0) even
+    though FAILURE_CHECK_INTERVAL stays fast. worker-1..3 never heartbeat
+    after registering (WorkerManager.register_worker stamps last_heartbeat
+    once, at registration, and it's never refreshed), and unlike
+    test_async_fault_tolerance.py's version of this test they can't safely
+    be registered lazily here -- assign_task() picks the first IDLE worker
+    in REGISTRATION order, and spare-worker must stay registered-after
+    worker-1..3 for each iteration's assign_task("task-1") to reliably
+    pick worker-i rather than the still-IDLE spare-worker. A generous fixed
+    timeout gives comfortable headroom for all 3 iterations' real
+    wall-clock cost (each does several real waits) without needing to
+    reorder registration."""
     assert MAX_TASK_ATTEMPTS == 3, "test assumes the current default of 3"
     monkeypatch.setattr(async_server, "FAILURE_CHECK_INTERVAL", 0.05)
-    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 1.0)
+    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 5.0)
 
     async def scenario():
         server, host, port = await start_master_server()
@@ -574,9 +596,20 @@ def test_heartbeats_and_tasks_interleave_without_corruption():
 def test_both_failure_detection_paths_converge_to_failed_and_requeue(monkeypatch):
     """worker-a's connection actually dies; worker-b's connection stays
     open but its heartbeats stop. Both converge on FAILED + requeue, and a
-    third, untouched worker mops up both tasks."""
+    third, untouched worker mops up both tasks.
+
+    Margin note: rescue-worker's heartbeat_interval was widened from 0.05
+    to 0.1 against a HEARTBEAT_TIMEOUT raised from 0.3 to 1.0 (a 10x
+    margin, matching every other test in this file). This test didn't
+    fail in the 150-run repro that caught the same 6x-margin pattern
+    flaking in two sibling tests (see test_no_false_failure_when_
+    heartbeats_continue and test_stale_result_cannot_overwrite_newer_
+    attempt_after_delay), but rescue-worker here is exactly as exposed:
+    if it were ever spuriously marked FAILED under load, both tasks would
+    never be reassigned and the test would hang until its 5s deadlines
+    expired. Widened preemptively rather than waiting to catch it live."""
     monkeypatch.setattr(async_server, "FAILURE_CHECK_INTERVAL", 0.05)
-    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 0.3)
+    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 1.0)
 
     async def scenario():
         server, host, port = await start_master_server()
@@ -597,7 +630,7 @@ def test_both_failure_detection_paths_converge_to_failed_and_requeue(monkeypatch
         await async_server.wait_for_workers(2)
 
         rescue_task = asyncio.create_task(
-            async_worker.run_worker(host, port, worker_id="rescue-worker", heartbeat_interval=0.05)
+            async_worker.run_worker(host, port, worker_id="rescue-worker", heartbeat_interval=0.1)
         )
         await async_server.wait_for_workers(3)
 

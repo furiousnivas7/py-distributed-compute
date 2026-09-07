@@ -49,6 +49,19 @@ async def stop_worker(task: asyncio.Task) -> None:
         pass
 
 
+async def wait_for_worker_id(worker_id: str, poll_interval: float = 0.01, timeout: float = 5.0) -> None:
+    """Wait for a SPECIFIC worker_id to be connected, rather than for a
+    total count. async_server.wait_for_workers(N) counts currently-open
+    connections -- when workers register and crash one at a time in
+    sequence, the total can drop back down after each crash and never
+    reach N again even though the worker we're waiting for is present."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while worker_id not in async_server.connections:
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError(f"worker {worker_id!r} never connected")
+        await asyncio.sleep(poll_interval)
+
+
 async def run_multi_task_crashing_worker(host: str, port: int, worker_id: str, task_count: int, ready: asyncio.Event) -> None:
     """Registers, then reads `task_count` TASK messages without replying to
     any of them, signals `ready`, and disconnects -- simulating a worker
@@ -145,14 +158,25 @@ def test_heartbeat_timeout_detected_while_connection_stays_open(monkeypatch):
 
 def test_no_false_failure_when_heartbeats_continue(monkeypatch):
     """A worker heartbeating faster than the timeout must never be marked
-    FAILED, even if the monitor checks well past HEARTBEAT_TIMEOUT."""
+    FAILED, even if the monitor checks well past HEARTBEAT_TIMEOUT.
+
+    Margin note: this was originally HEARTBEAT_TIMEOUT=0.3 / heartbeat_
+    interval=0.05 (a 6x margin) and was found to be genuinely flaky under
+    real system load -- a repro loop of 150 back-to-back runs (see Phase
+    9.1 follow-up) caught it failing ~1-2% of the time, because a single
+    real heartbeat delayed past 250ms by ordinary OS/event-loop scheduling
+    jitter is enough to trip a false-positive failure. Every other test in
+    this file/test_async_regression.py uses a 10x margin (1.0s timeout /
+    0.1s interval) and none of those have ever been observed to flake
+    across 250+ cumulative runs, so this was widened to match rather than
+    kept tight for speed."""
     monkeypatch.setattr(async_server, "FAILURE_CHECK_INTERVAL", 0.05)
-    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 0.3)
+    monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 1.0)
 
     async def scenario():
         server, host, port = await start_master_server()
         worker_task = asyncio.create_task(
-            async_worker.run_worker(host, port, worker_id="worker-1", heartbeat_interval=0.05)
+            async_worker.run_worker(host, port, worker_id="worker-1", heartbeat_interval=0.1)
         )
         stop_event = asyncio.Event()
         monitor_task = asyncio.create_task(async_server.failure_monitor(stop_event))
@@ -160,8 +184,8 @@ def test_no_false_failure_when_heartbeats_continue(monkeypatch):
             await async_server.wait_for_workers(1)
 
             # Well past HEARTBEAT_TIMEOUT, checked many times over.
-            for _ in range(10):
-                await asyncio.sleep(0.1)
+            for _ in range(15):
+                await asyncio.sleep(0.15)
                 assert async_server.worker_manager.get_worker("worker-1").status == WorkerStatus.IDLE
         finally:
             stop_event.set()
@@ -348,7 +372,35 @@ def test_retry_exhaustion_after_max_attempts(monkeypatch):
     fails -> PENDING, attempt 2 fails -> PENDING, attempt 3 fails -> FAILED,
     with no attempt 4 -- proving MAX_TASK_ATTEMPTS is enforced through the
     real async dispatch + failure_monitor path, not just at the Scheduler
-    unit level (already covered in tests/test_scheduler.py)."""
+    unit level (already covered in tests/test_scheduler.py).
+
+    Root cause of an intermittent failure found via a 150-run repro loop
+    (Phase 9.1 follow-up): failure_monitor is a LIVE background task here
+    (deliberately -- this test wants to prove ITS real requeue+redispatch
+    path, not just manual orchestration), and on every FAILURE_CHECK_INTERVAL
+    tick it re-scans for stale workers and, upon finding one, calls
+    drain_pending_tasks() itself -- synchronously, with no `await` between
+    detecting staleness and grabbing+dispatching the newly-PENDING task to
+    whichever worker is currently IDLE. Once worker-(i-1) is forced stale,
+    THE MOMENT worker-i registers and goes IDLE, failure_monitor's own next
+    tick (as fast as 0.05s later) can grab and dispatch the requeued task
+    to it before this test's own manual assign_next_pending_task() call
+    gets a turn -- an inherent race between two independent callers of the
+    same scheduler (the exact hazard Phase 8.8 addressed for concurrent
+    MapReduce jobs, just showing up here between a test's manual control
+    and failure_monitor's autonomous fallback). Under real system load the
+    race could go either way, and a manual assign_next_pending_task() call
+    that loses it returns None, crashing the test's own assertion.
+
+    Fix: for i=1 no staleness exists yet, so nothing else could be racing
+    -- manual assign+dispatch stays as the (only) way that attempt starts.
+    For i=2 and i=3, this no longer calls assign_next_pending_task() /
+    dispatch_assigned_task() at all -- that's the whole point being tested,
+    so the test just registers the next worker and OBSERVES that
+    failure_monitor's own pipeline reassigns and redispatches to it
+    correctly (via ready.wait() firing and task.assigned_worker_id/attempt
+    matching), rather than competing with it for who gets to perform the
+    (re)assignment."""
     from master.scheduler import MAX_TASK_ATTEMPTS
 
     assert MAX_TASK_ATTEMPTS == 3, "test assumes the current default of 3"
@@ -356,44 +408,62 @@ def test_retry_exhaustion_after_max_attempts(monkeypatch):
     monkeypatch.setattr(async_server, "FAILURE_CHECK_INTERVAL", 0.05)
     monkeypatch.setattr(async_server, "HEARTBEAT_TIMEOUT", 1.0)
 
+    async def force_stale_and_wait_failed(worker_id: str) -> None:
+        async_server.worker_manager.get_worker(worker_id).last_heartbeat = time.time() - 10
+        deadline = time.monotonic() + 5
+        while (
+            async_server.worker_manager.get_worker(worker_id).status != WorkerStatus.FAILED
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.02)
+        assert async_server.worker_manager.get_worker(worker_id).status == WorkerStatus.FAILED
+
     async def scenario():
         server, host, port = await start_master_server()
 
         worker_tasks = []
-        ready_events = []
-        for i in range(1, MAX_TASK_ATTEMPTS + 1):
-            ready = asyncio.Event()
-            ready_events.append(ready)
-            worker_tasks.append(
-                asyncio.create_task(run_multi_task_crashing_worker(host, port, f"worker-{i}", 1, ready))
-            )
-            await async_server.wait_for_workers(i)
-
         stop_event = asyncio.Event()
         monitor_task = asyncio.create_task(async_server.failure_monitor(stop_event))
 
         try:
             task = async_server.scheduler.submit_task("task-1", "ADD", {"a": 1, "b": 1})
 
-            for i in range(1, MAX_TASK_ATTEMPTS + 1):
+            # i=1: no staleness exists yet, so nothing else can grab this
+            # task -- a manual assign+dispatch is required and safe.
+            ready1 = asyncio.Event()
+            worker_tasks.append(asyncio.create_task(run_multi_task_crashing_worker(host, port, "worker-1", 1, ready1)))
+            await wait_for_worker_id("worker-1")
+
+            assigned = async_server.scheduler.assign_next_pending_task()
+            assert assigned.assigned_worker_id == "worker-1"
+            assert assigned.attempt == 1
+
+            dispatch1 = asyncio.create_task(async_server.dispatch_assigned_task(task))
+            await asyncio.wait_for(ready1.wait(), timeout=5)
+            await force_stale_and_wait_failed("worker-1")
+            await dispatch1
+
+            # i=2, i=3: worker-(i-1) is now stale and its task requeued --
+            # failure_monitor's own background tick will reassign and
+            # redispatch it to worker-i the moment it registers. Don't
+            # compete with that; just observe it happen.
+            for i in range(2, MAX_TASK_ATTEMPTS + 1):
                 worker_id = f"worker-{i}"
-                assigned = async_server.scheduler.assign_next_pending_task()
-                assert assigned.assigned_worker_id == worker_id
-                assert assigned.attempt == i
+                ready = asyncio.Event()
+                worker_tasks.append(
+                    asyncio.create_task(run_multi_task_crashing_worker(host, port, worker_id, 1, ready))
+                )
+                await wait_for_worker_id(worker_id)
 
-                dispatch = asyncio.create_task(async_server.dispatch_assigned_task(task))
-                await asyncio.wait_for(ready_events[i - 1].wait(), timeout=5)
+                await asyncio.wait_for(ready.wait(), timeout=5)
+                assert task.assigned_worker_id == worker_id
+                assert task.attempt == i
 
-                async_server.worker_manager.get_worker(worker_id).last_heartbeat = time.time() - 10
-                deadline = time.monotonic() + 5
-                while (
-                    async_server.worker_manager.get_worker(worker_id).status != WorkerStatus.FAILED
-                    and time.monotonic() < deadline
-                ):
-                    await asyncio.sleep(0.02)
-                assert async_server.worker_manager.get_worker(worker_id).status == WorkerStatus.FAILED
+                await force_stale_and_wait_failed(worker_id)
 
-                await dispatch
+            deadline = time.monotonic() + 5
+            while task.status != TaskStatus.FAILED and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
 
             assert task.status == TaskStatus.FAILED
             assert task.attempt == MAX_TASK_ATTEMPTS

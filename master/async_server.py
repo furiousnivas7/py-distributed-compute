@@ -132,6 +132,34 @@ def clear_dispatch_registry() -> None:
     _task_futures.clear()
 
 
+def attempt_request_id(task_id: str, attempt: int) -> str:
+    """The wire identity of one specific execution attempt.
+
+    (task_id, attempt) -- not task_id alone -- is what identifies a
+    particular attempt to run a task; this is the single place that
+    encoding is produced, for every message this module builds that refers
+    to an attempt (an outgoing TASK, or a WORKER_UNREACHABLE error standing
+    in for a TASK_RESULT that will never arrive).
+
+    Folding attempt into the request_id (rather than just task_id) matters
+    for WorkerLink.resolve() below: a worker is only ever BUSY with one
+    task at a time, so in practice a single worker_id is never mid-flight
+    on two attempts of the same task_id simultaneously -- but if a worker
+    that failed one attempt (heartbeat timeout, connection stays open)
+    were ever reused for a LATER attempt of the same task_id before its
+    first attempt's reply arrives, a request_id keyed on task_id alone
+    would let that stale attempt-N reply resolve attempt-(N+1)'s pending
+    Future. Keying on the full (task_id, attempt) pair instead means a
+    stale reply's request_id simply won't match any current entry in
+    WorkerLink._pending -- it falls through to handle_worker_connection's
+    ordinary rpc_handler.handle_request path, which already replies
+    UNKNOWN_COMMAND to an unrecognized TASK_RESULT instead of resolving
+    anything, misattribution is structurally impossible rather than
+    something a runtime check has to catch.
+    """
+    return f"task-{task_id}:{attempt}"
+
+
 class WorkerLink:
     """Owns the single read loop for one worker's persistent connection.
 
@@ -139,9 +167,10 @@ class WorkerLink:
     a coroutine that wants to send a TASK and await its TASK_RESULT can't
     just read the reply itself -- another message (a HEARTBEAT, say) could
     legitimately arrive first. Instead it registers a Future here, keyed by
-    the TASK's request_id, and awaits that; the connection's one read loop
-    (see handle_worker_connection) resolves it when the matching reply
-    shows up, or fails every pending Future if the connection dies first.
+    the TASK's request_id (see attempt_request_id), and awaits that; the
+    connection's one read loop (see handle_worker_connection) resolves it
+    when the matching reply shows up, or fails every pending Future if the
+    connection dies first.
     """
 
     def __init__(self, conn: AsyncConnection):
@@ -149,7 +178,7 @@ class WorkerLink:
         self._pending: dict[str, asyncio.Future] = {}
 
     async def send_task(self, task_id: str, task_type: str, task_payload: dict, attempt: int) -> dict:
-        request_id = f"task-{task_id}"
+        request_id = attempt_request_id(task_id, attempt)
         request = build_message(
             protocol.TASK,
             request_id,
@@ -267,7 +296,7 @@ async def dispatch_assigned_task(task) -> dict:
         mark_worker_failed_and_requeue(was_current)
         response = build_message(
             protocol.ERROR,
-            f"task-{task.task_id}",
+            attempt_request_id(task.task_id, attempt),
             {"task_id": task.task_id, "attempt": attempt, "code": "WORKER_UNREACHABLE", "message": "no connection"},
         )
         record_if_terminal(response, was_current)
@@ -282,7 +311,7 @@ async def dispatch_assigned_task(task) -> dict:
         mark_worker_failed_and_requeue(was_current)
         response = build_message(
             protocol.ERROR,
-            f"task-{task.task_id}",
+            attempt_request_id(task.task_id, attempt),
             {"task_id": task.task_id, "attempt": attempt, "code": "WORKER_UNREACHABLE", "message": str(exc)},
         )
         record_if_terminal(response, was_current)
