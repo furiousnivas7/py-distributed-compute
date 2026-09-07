@@ -259,6 +259,24 @@ async def handle_worker_connection(reader: asyncio.StreamReader, writer: asyncio
                 await send_message(conn, error)
                 continue
 
+            # Phase 9.2.2 invariant: once a WorkerLink has been superseded,
+            # no message received from it may mutate worker/task state.
+            #
+            # This closes a narrow gap left by proactively closing a
+            # superseded connection (see the docstring above). Closing a
+            # writer doesn't retroactively un-receive bytes this
+            # connection's reader already had buffered before the close
+            # happened -- a HEARTBEAT (or anything else) that was already
+            # in flight at that exact moment could still be sitting in
+            # `reader`'s buffer and come back from receive_message() above
+            # even though `link` is no longer current. Checking here,
+            # before any further processing, means such a message is
+            # simply dropped instead of being allowed to mutate state
+            # (e.g. refresh last_heartbeat) on behalf of a generation
+            # that's already been replaced.
+            if worker_id is not None and connections.get(worker_id) is not link:
+                return
+
             request_id = message.get("request_id")
             if request_id and link.resolve(request_id, message):
                 continue

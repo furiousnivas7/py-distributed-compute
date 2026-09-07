@@ -374,6 +374,35 @@ def test_requeue_multiple_tasks_for_failed_worker():
     assert task2.assigned_worker_id is None
 
 
+def test_requeue_tasks_for_worker_is_idempotent_when_called_twice():
+    """Phase 9.2.2: a worker's failure can legitimately be detected by more
+    than one independent path (a connection dying mid-dispatch, and the
+    heartbeat monitor's own periodic scan both eventually notice the same
+    dead worker) -- requeue_tasks_for_worker must be safe to call twice in
+    a row for the same worker without double-touching anything. The first
+    call already cleared assigned_worker_id, so the second call's scan
+    (which matches on `task.assigned_worker_id == worker_id`) simply finds
+    nothing left to requeue for that worker -- no double-increment, no
+    corruption -- by construction, not because of any explicit guard."""
+    manager = WorkerManager()
+    scheduler = Scheduler(manager)
+
+    manager.register_worker("worker-1", "127.0.0.1", 6001)
+    task = scheduler.submit_task("task-1", "ADD", {"a": 1, "b": 2})
+    scheduler.assign_task("task-1")
+    assert task.attempt == 1
+
+    first = scheduler.requeue_tasks_for_worker("worker-1")
+    assert len(first) == 1
+    assert task.status == TaskStatus.PENDING
+    assert task.attempt == 1
+
+    second = scheduler.requeue_tasks_for_worker("worker-1")
+    assert second == []
+    assert task.status == TaskStatus.PENDING
+    assert task.attempt == 1
+
+
 def test_worker_failure_does_not_requeue_completed_tasks():
     manager = WorkerManager()
     scheduler = Scheduler(manager)
