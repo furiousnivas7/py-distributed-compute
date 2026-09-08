@@ -17,7 +17,7 @@ from rpc import protocol
 from rpc.async_connection import AsyncConnection
 from rpc.async_rpc import new_request_id, receive_message, send_message, send_request
 from rpc.protocol import build_message
-from worker.executor import execute_task
+from worker.backend import DirectBackend, ExecutionBackend
 
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 5000
@@ -96,12 +96,13 @@ async def start_heartbeat_loop(
             return
 
 
-async def serve_tasks(conn: AsyncConnection) -> None:
+async def serve_tasks(conn: AsyncConnection, backend: ExecutionBackend) -> None:
     """Read every message on this connection until it closes.
 
-    Executes any TASK it receives and replies with TASK_RESULT; silently
-    ignores anything else it doesn't recognize (e.g. the HEARTBEAT_ACK for
-    a heartbeat it sent, since those are fire-and-forget here).
+    Executes any TASK it receives (via `backend` -- Phase 11.1; see
+    worker/backend.py) and replies with TASK_RESULT; silently ignores
+    anything else it doesn't recognize (e.g. the HEARTBEAT_ACK for a
+    heartbeat it sent, since those are fire-and-forget here).
     """
     while True:
         try:
@@ -118,7 +119,7 @@ async def serve_tasks(conn: AsyncConnection) -> None:
         task_args = task_payload["task_payload"]
         attempt = task_payload.get("attempt", 1)
 
-        result = execute_task(task_type, task_args)
+        result = await backend.execute(task_type, task_args)
         print(f"Executed task {task_id} (attempt {attempt}): {result}")
 
         response = build_message(
@@ -137,8 +138,17 @@ async def run_worker(
     worker_port: int = WORKER_PORT,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
     shutdown_event: asyncio.Event | None = None,
+    backend: ExecutionBackend | None = None,
 ) -> None:
-    """Run until the connection ends. Passing `shutdown_event` enables
+    """Run until the connection ends. `backend` (Phase 11.1; see
+    worker/backend.py) selects HOW submitted tasks actually run --
+    defaults to DirectBackend, an in-process call, identical to every
+    worker's behavior before Phase 11. Passing a different backend (e.g.
+    Phase 11.2's multiprocessing one) changes nothing about how tasks are
+    submitted or what a result looks like; only how the worker internally
+    carries the work out.
+
+    Passing `shutdown_event` enables
     graceful shutdown (Phase 9.2.3): setting it requests that this worker
     stop accepting new work, finish whatever it's currently doing, and
     disconnect -- the master will close the connection at the right
@@ -161,6 +171,9 @@ async def run_worker(
     before -- serve_tasks() only ever ends via the connection dying, which
     run_worker()'s caller
     (e.g. a crash, or the process being killed) still controls."""
+    if backend is None:
+        backend = DirectBackend()
+
     reader, writer = await asyncio.open_connection(master_host, master_port)
     conn = AsyncConnection(reader, writer)
     print("Connected to master")
@@ -169,6 +182,7 @@ async def run_worker(
     heartbeat_task = None
     shutdown_watcher = None
 
+    await backend.start()
     try:
         ping_response = await send_request(conn, protocol.PING)
         print(f"Status: {ping_response['payload'].get('status')}")
@@ -182,7 +196,7 @@ async def run_worker(
         if shutdown_event is not None:
             shutdown_watcher = asyncio.create_task(watch_for_shutdown(conn, worker_id, shutdown_event))
 
-        await serve_tasks(conn)
+        await serve_tasks(conn, backend)
     finally:
         stop_heartbeat.set()
         if heartbeat_task is not None:
@@ -193,6 +207,7 @@ async def run_worker(
                 await shutdown_watcher
             except asyncio.CancelledError:
                 pass
+        await backend.stop()
         await conn.close()
 
 
