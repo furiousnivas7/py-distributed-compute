@@ -136,12 +136,7 @@ class Scheduler:
             )
 
         task.status = TaskStatus.COMPLETED
-
-        if task.assigned_worker_id is not None:
-            self.worker_manager.update_status(
-                task.assigned_worker_id,
-                WorkerStatus.IDLE,
-            )
+        self._release_worker(task.assigned_worker_id)
 
         return task
 
@@ -149,14 +144,28 @@ class Scheduler:
         task = self._get_existing_task(task_id)
 
         task.status = TaskStatus.FAILED
-
-        if task.assigned_worker_id is not None:
-            self.worker_manager.update_status(
-                task.assigned_worker_id,
-                WorkerStatus.IDLE,
-            )
+        self._release_worker(task.assigned_worker_id)
 
         return task
+
+    def _release_worker(self, worker_id: str | None) -> None:
+        """A task finishing (success or failure) frees its worker to take
+        more work -- unless that worker is DRAINING (Phase 9.2.3), in
+        which case it must NOT be handed back to IDLE: it already asked to
+        stop accepting new work, and this was its last assignment. Leaving
+        it DRAINING is what lets master/async_server.py's dispatch
+        completion path recognize "this DRAINING worker just finished its
+        task" and close its connection, rather than the scheduler silently
+        making it assignable again.
+        """
+        if worker_id is None:
+            return
+
+        worker = self.worker_manager.get_worker(worker_id)
+        if worker is not None and worker.status == WorkerStatus.DRAINING:
+            return
+
+        self.worker_manager.update_status(worker_id, WorkerStatus.IDLE)
 
     def requeue_tasks_for_worker(self, worker_id: str) -> list[Task]:
         """Send a failed worker's in-flight tasks back to PENDING so the

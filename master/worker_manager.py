@@ -18,7 +18,16 @@ VALID_WORKER_STATUSES = {
     WorkerStatus.IDLE,
     WorkerStatus.BUSY,
     WorkerStatus.FAILED,
+    WorkerStatus.DRAINING,
+    WorkerStatus.STOPPED,
 }
+
+# A worker_id in either of these states has no live connection currently
+# representing it, so a new registration for it is a legitimate reconnect
+# (replacement, bumped generation) rather than a conflict. FAILED is a
+# crash; STOPPED is an intentional, clean exit -- both leave the worker_id
+# free to come back.
+REPLACEABLE_WORKER_STATUSES = {WorkerStatus.FAILED, WorkerStatus.STOPPED}
 
 
 class WorkerManager:
@@ -29,21 +38,23 @@ class WorkerManager:
         return worker_id in self._workers
 
     def register_worker(self, worker_id: str, host: str, port: int) -> Worker:
-        """Register worker_id, or -- if it already exists and is FAILED --
-        replace it in place with a new generation (see Worker.generation).
+        """Register worker_id, or -- if it already exists and is FAILED or
+        STOPPED (see REPLACEABLE_WORKER_STATUSES) -- replace it in place
+        with a new generation (see Worker.generation).
 
         worker_id is a stable LOGICAL identity a worker keeps across
         reconnects; generation identifies which physical connection
         currently speaks for it. Replacement is only allowed once the
-        existing entry is FAILED: a worker_id that's REGISTERED/IDLE/BUSY
-        still has a live connection actively representing it, so a second
-        registration attempt for it is a genuine conflict (still rejected
-        as DuplicateWorkerError, unchanged from before) rather than a
-        legitimate reconnect. Bumping generation rather than replacing the
-        Worker object outright keeps every existing get_worker() reference
-        (and the object identity tests may hold onto) pointing at the
-        current state, matching how Task/Worker are mutated in place
-        everywhere else in this codebase.
+        existing entry has no live connection representing it -- FAILED
+        (crashed) or STOPPED (cleanly finished draining and disconnected,
+        Phase 9.2.3). A worker_id that's REGISTERED/IDLE/BUSY/DRAINING
+        still has a live connection, so a second registration attempt for
+        it is a genuine conflict (still rejected as DuplicateWorkerError,
+        unchanged from before) rather than a legitimate reconnect. Bumping
+        generation rather than replacing the Worker object outright keeps
+        every existing get_worker() reference (and the object identity
+        tests may hold onto) pointing at the current state, matching how
+        Task/Worker are mutated in place everywhere else in this codebase.
         """
         if not isinstance(worker_id, str) or not worker_id:
             raise ValueError("worker_id must be a non-empty string")
@@ -54,7 +65,7 @@ class WorkerManager:
 
         existing = self._workers.get(worker_id)
         if existing is not None:
-            if existing.status != WorkerStatus.FAILED:
+            if existing.status not in REPLACEABLE_WORKER_STATUSES:
                 raise DuplicateWorkerError(f"Worker already registered: {worker_id}")
 
             existing.host = host
@@ -101,12 +112,16 @@ class WorkerManager:
     def get_stale_workers(self, timeout: float) -> list[Worker]:
         """Mark FAILED and return every worker whose last heartbeat is older
         than `timeout` seconds. A worker that has never sent a heartbeat
-        (last_heartbeat is None) is skipped, not treated as stale."""
+        (last_heartbeat is None) is skipped, not treated as stale. So is
+        one that's already STOPPED (Phase 9.2.3): it cleanly finished
+        draining and disconnected on purpose, so its heartbeat naturally
+        stopped too -- that's expected, not a failure, and must not be
+        reclassified as one just because time passed."""
         now = time.time()
         stale_workers = []
 
         for worker in self._workers.values():
-            if worker.last_heartbeat is None:
+            if worker.last_heartbeat is None or worker.status == WorkerStatus.STOPPED:
                 continue
 
             if now - worker.last_heartbeat > timeout:

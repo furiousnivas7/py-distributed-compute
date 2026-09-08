@@ -8,6 +8,16 @@ class WorkerStatus:
     IDLE = "IDLE"
     BUSY = "BUSY"
     FAILED = "FAILED"
+    # Phase 9.2.3 -- graceful shutdown. DRAINING: the worker asked to stop
+    # (SHUTDOWN) but its current task, if any, is still allowed to finish;
+    # it's excluded from new assignment (Scheduler.assign_task only picks
+    # IDLE) without needing any change there. STOPPED: draining finished
+    # and the worker disconnected cleanly -- a terminal state distinct
+    # from FAILED so failure_monitor doesn't mistake an intentional exit
+    # for a crash, but one that (like FAILED) still allows the same
+    # worker_id to re-register later with a bumped generation.
+    DRAINING = "DRAINING"
+    STOPPED = "STOPPED"
 
 
 class TaskStatus:

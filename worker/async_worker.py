@@ -48,6 +48,34 @@ async def send_heartbeat(conn: AsyncConnection, worker_id: str) -> None:
     await send_message(conn, request)
 
 
+async def send_shutdown(conn: AsyncConnection, worker_id: str) -> None:
+    """Notify the master this worker intends to stop accepting new work.
+
+    Fire-and-forget, like send_heartbeat -- the master decides when it's
+    actually safe to close this connection (immediately if nothing is
+    currently assigned, or once the in-flight task finishes) rather than
+    this worker guessing at timing. See master/async_server.py's
+    handle_worker_connection (the SHUTDOWN branch) and
+    dispatch_assigned_task's DRAINING completion check.
+    """
+    request = build_message(protocol.SHUTDOWN, new_request_id(), {"worker_id": worker_id})
+    await send_message(conn, request)
+
+
+async def watch_for_shutdown(conn: AsyncConnection, worker_id: str, shutdown_event: asyncio.Event) -> None:
+    """Wait for `shutdown_event`, then send SHUTDOWN once. Runs alongside
+    serve_tasks() the same way the heartbeat loop does; serve_tasks()
+    itself needs no changes; it just keeps running normally (able to
+    finish serving a task already in flight, or receive one last
+    legitimately-in-flight TASK that crossed with this SHUTDOWN on the
+    wire) until the master closes the connection at the right moment."""
+    await shutdown_event.wait()
+    try:
+        await send_shutdown(conn, worker_id)
+    except (ConnectionError, OSError):
+        pass
+
+
 async def start_heartbeat_loop(
     conn: AsyncConnection,
     worker_id: str,
@@ -108,13 +136,38 @@ async def run_worker(
     worker_host: str = WORKER_HOST,
     worker_port: int = WORKER_PORT,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+    shutdown_event: asyncio.Event | None = None,
 ) -> None:
+    """Run until the connection ends. Passing `shutdown_event` enables
+    graceful shutdown (Phase 9.2.3): setting it requests that this worker
+    stop accepting new work, finish whatever it's currently doing, and
+    disconnect -- the master will close the connection at the right
+    moment (see watch_for_shutdown/handle_worker_connection), so
+    run_worker() itself doesn't need to guess when that is.
+
+    API contract: this is fire-and-forget from the caller's side --
+    setting `shutdown_event` does NOT wait for, or guarantee, that any
+    task already submitted to the scheduler has actually been assigned to
+    THIS worker yet. If the worker is still IDLE (nothing assigned) when
+    the master processes SHUTDOWN, it stops immediately -- a task that
+    was submitted just before but never reached this worker stays PENDING
+    for someone else. A caller that needs a specific task to run on this
+    worker before it drains must wait until that task has actually been
+    assigned/dispatched (not merely submitted) before setting
+    shutdown_event; there is deliberately no grace period here that would
+    paper over that ordering with timing-dependent behavior instead.
+
+    Without shutdown_event (the default), this worker behaves exactly as
+    before -- serve_tasks() only ever ends via the connection dying, which
+    run_worker()'s caller
+    (e.g. a crash, or the process being killed) still controls."""
     reader, writer = await asyncio.open_connection(master_host, master_port)
     conn = AsyncConnection(reader, writer)
     print("Connected to master")
 
     stop_heartbeat = asyncio.Event()
     heartbeat_task = None
+    shutdown_watcher = None
 
     try:
         ping_response = await send_request(conn, protocol.PING)
@@ -126,12 +179,20 @@ async def run_worker(
         heartbeat_task = asyncio.create_task(
             start_heartbeat_loop(conn, worker_id, stop_heartbeat, heartbeat_interval)
         )
+        if shutdown_event is not None:
+            shutdown_watcher = asyncio.create_task(watch_for_shutdown(conn, worker_id, shutdown_event))
 
         await serve_tasks(conn)
     finally:
         stop_heartbeat.set()
         if heartbeat_task is not None:
             await heartbeat_task
+        if shutdown_watcher is not None:
+            shutdown_watcher.cancel()
+            try:
+                await shutdown_watcher
+            except asyncio.CancelledError:
+                pass
         await conn.close()
 
 

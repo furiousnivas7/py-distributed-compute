@@ -217,6 +217,15 @@ class WorkerLink:
             if not future.done():
                 future.set_exception(exc)
 
+    def has_pending(self) -> bool:
+        """Whether a send_task() call is currently awaiting a reply on this
+        connection. Phase 9.2.3 uses this to tell "this connection just
+        closed with nothing in flight" (safe to treat a DRAINING worker as
+        cleanly STOPPED) apart from "a dispatch was still outstanding"
+        (that's a genuine failure -- dispatch_assigned_task's own
+        except-branch handles it, unrelated to draining)."""
+        return bool(self._pending)
+
 
 async def handle_worker_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Per-connection coroutine registered with asyncio.start_server.
@@ -291,9 +300,32 @@ async def handle_worker_connection(reader: asyncio.StreamReader, writer: asyncio
                 connections[worker_id] = link
                 if previous_link is not None and previous_link is not link:
                     await previous_link.conn.close()
+            elif message["type"] == protocol.SHUTDOWN and response["type"] == protocol.SHUTDOWN_ACK:
+                # Phase 9.2.3: the worker asked to stop accepting new work.
+                # rpc_handler.handle_shutdown already moved it to DRAINING;
+                # if nothing is currently in flight on this connection
+                # (has_pending() false -- no task was dispatched to it that
+                # we're still awaiting a reply for), there's nothing left
+                # to wait for, so it's safe to close right away. If
+                # something IS in flight, leave the connection open --
+                # dispatch_assigned_task's own completion path (see below)
+                # is what closes it once that task actually finishes.
+                if worker_id is not None and not link.has_pending():
+                    return
     finally:
         if worker_id is not None and connections.get(worker_id) is link:
             connections.pop(worker_id, None)
+            worker = worker_manager.get_worker(worker_id)
+            if worker is not None and worker.status == WorkerStatus.DRAINING and not link.has_pending():
+                # Reached via either the SHUTDOWN branch above returning,
+                # or the worker closing the connection itself once its own
+                # serve loop notices nothing more is coming -- either way,
+                # this is an intentional, clean exit, not a crash. STOPPED
+                # (not FAILED) keeps failure_monitor from later mistaking
+                # the now-silent heartbeat for a failure, and still allows
+                # this worker_id to reconnect later (see
+                # WorkerManager.register_worker's REPLACEABLE_WORKER_STATUSES).
+                worker_manager.update_status(worker_id, WorkerStatus.STOPPED)
         link.fail_pending(ConnectionError("Worker connection closed"))
         await conn.close()
 
@@ -369,6 +401,7 @@ async def dispatch_assigned_task(task) -> dict:
         was_current = is_current_attempt()
         if was_current:
             scheduler.fail_task(task.task_id)
+            await _close_connection_if_draining(worker_id)
         record_if_terminal(response, was_current)
         return response
 
@@ -380,9 +413,29 @@ async def dispatch_assigned_task(task) -> dict:
         scheduler.complete_task(task.task_id)
     else:
         scheduler.fail_task(task.task_id)
+    await _close_connection_if_draining(worker_id)
 
     record_if_terminal(response, True)
     return response
+
+
+async def _close_connection_if_draining(worker_id: str) -> None:
+    """Phase 9.2.3: a task just finished (success or failure) on
+    `worker_id`'s connection. Scheduler._release_worker deliberately leaves
+    a DRAINING worker DRAINING instead of handing it back to IDLE -- this
+    is the other half of that: recognizing "this was a DRAINING worker's
+    last assignment" and closing its connection now that nothing is left
+    for it to do. handle_worker_connection's own `finally` block is what
+    actually reclassifies DRAINING -> STOPPED once the resulting
+    disconnect comes through, matching the SHUTDOWN-while-IDLE path so
+    both converge on the same cleanup logic.
+    """
+    worker = worker_manager.get_worker(worker_id)
+    if worker is None or worker.status != WorkerStatus.DRAINING:
+        return
+    link = connections.get(worker_id)
+    if link is not None:
+        await link.conn.close()
 
 
 async def drain_tasks_for(task_ids: set[str] | None, poll_interval: float = 0.01, timeout: float = 30.0) -> list[dict]:
