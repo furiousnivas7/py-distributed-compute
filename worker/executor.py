@@ -2,12 +2,13 @@
 
 import json
 
-from worker import registry
+from worker import registry, serialization
 
 ADD = "ADD"
 MULTIPLY = "MULTIPLY"
 MAP = "MAP"
 REDUCE = "REDUCE"
+EXECUTE = "EXECUTE"
 
 # Named operations only -- no arbitrary Python function serialization.
 # Keeps the wire protocol a fixed, deterministic vocabulary rather than
@@ -133,6 +134,73 @@ def execute_registered(operation: str, payload: dict):
     return result
 
 
+def execute_envelope(payload: dict):
+    """Phase 10.3: the unified, explicit entry point for function-execution
+    tasks (task_type EXECUTE). Distinguishes two execution modes by an
+    explicit 'execution_mode' discriminator rather than inferring which
+    one a payload shape must mean:
+
+        {"execution_mode": "registered", "operation": "add",
+         "payload": {"a": 1, "b": 2}}
+
+        {"execution_mode": "serialized_callable", "callable": "<base64>",
+         "args": [...], "kwargs": {...}}
+
+    'registered' delegates straight to execute_registered (Phase 10.2) --
+    same lookup, same fn(**payload) calling convention, just reached via
+    an explicit envelope instead of task_type doubling as the operation
+    name. 'serialized_callable' is the genuinely new capability this
+    phase adds: an arbitrary Python callable, serialized by the SUBMITTER
+    (see worker/serialization.py and jobs/call.py's submit_serialized_call),
+    shipped over the wire, and executed here. See worker/serialization.py's
+    module docstring for the trust-boundary implications of that -- this
+    function itself does no sandboxing; it only isolates the (de)serialize
+    step through that module rather than calling cloudpickle directly.
+    """
+    mode = payload.get("execution_mode")
+
+    if mode == "registered":
+        operation = payload.get("operation")
+        if not isinstance(operation, str) or not operation:
+            raise ExecutionError("payload must contain a non-empty string field 'operation'")
+        return execute_registered(operation, payload.get("payload", {}))
+
+    if mode == "serialized_callable":
+        return _execute_serialized_callable(payload)
+
+    raise ExecutionError(f"Unsupported execution_mode: {mode!r}")
+
+
+def _execute_serialized_callable(payload: dict):
+    encoded = payload.get("callable")
+    args = payload.get("args", [])
+    kwargs = payload.get("kwargs", {})
+
+    if not isinstance(encoded, str) or not encoded:
+        raise ExecutionError("payload must contain a non-empty string field 'callable'")
+    if not isinstance(args, list):
+        raise ExecutionError("payload field 'args' must be a list")
+    if not isinstance(kwargs, dict):
+        raise ExecutionError("payload field 'kwargs' must be an object")
+
+    try:
+        fn = serialization.deserialize_callable(serialization.decode_from_wire(encoded))
+    except serialization.SerializationError as exc:
+        raise ExecutionError(str(exc)) from exc
+
+    try:
+        result = fn(*args, **kwargs)
+    except Exception as exc:
+        raise ExecutionError(f"{type(exc).__name__}: {exc}") from exc
+
+    try:
+        json.dumps(result)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionError(f"Return value is not JSON-serializable: {exc}") from exc
+
+    return result
+
+
 def _require_numbers(payload: dict):
     a = payload.get("a")
     b = payload.get("b")
@@ -147,6 +215,7 @@ HANDLERS = {
     MULTIPLY: execute_multiply,
     MAP: execute_map,
     REDUCE: execute_reduce,
+    EXECUTE: execute_envelope,
 }
 
 
