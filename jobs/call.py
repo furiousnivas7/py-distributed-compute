@@ -65,14 +65,38 @@ def submit_serialized_call(
     return scheduler.submit_task(task_id, "EXECUTE", payload)
 
 
+class CallError(ValueError):
+    """Raised by collect_call_result() on any failure -- a ValueError
+    subclass so existing `except ValueError`/`pytest.raises(ValueError)`
+    code keeps working unchanged, but with a `.code` (Phase 10.4:
+    worker.executor.ExecutionErrorCode for an execution failure, or a
+    transport-level code like WORKER_UNREACHABLE if the task was never
+    even attempted -- see collect_call_result) and `.message` a caller
+    can inspect to handle specific failure categories programmatically
+    instead of string-matching the exception text.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(f"CALL task failed: {message}")
+        self.code = code
+        self.message = message
+
+
 def collect_call_result(response: dict):
     """Extract a function-execution task's return value from its
-    TASK_RESULT/ERROR response, raising ValueError with the worker's own
-    error message on failure rather than returning some silent
-    placeholder -- a caller asking for a specific result has no use for
-    an ambiguous "it didn't work" outcome."""
+    TASK_RESULT/ERROR response, raising CallError with the worker's own
+    structured code and message on failure rather than returning some
+    silent placeholder -- a caller asking for a specific result has no
+    use for an ambiguous "it didn't work" outcome. `code` reflects
+    whichever kind of failure actually happened: an execution failure
+    (worker.executor.ExecutionErrorCode -- the task was attempted and
+    failed for a specific, categorized reason) and a transport failure
+    (e.g. WORKER_UNREACHABLE -- the task was never attempted at all) both
+    flow through the same `payload["code"]` field already, so no
+    special-casing is needed here to expose either kind uniformly."""
     payload = response.get("payload", {})
     if payload.get("status") != "success":
+        code = payload.get("code", "UNKNOWN")
         message = payload.get("message", "unknown error")
-        raise ValueError(f"CALL task failed: {message}")
+        raise CallError(code, message)
     return payload["result"]
