@@ -8,7 +8,6 @@ ADD = "ADD"
 MULTIPLY = "MULTIPLY"
 MAP = "MAP"
 REDUCE = "REDUCE"
-CALL = "CALL"
 
 # Named operations only -- no arbitrary Python function serialization.
 # Keeps the wire protocol a fixed, deterministic vocabulary rather than
@@ -95,45 +94,41 @@ def execute_reduce(payload: dict):
     return REDUCE_OPERATIONS[operation](values)
 
 
-def execute_call(payload: dict):
-    """Phase 10.1: invoke a pre-registered function (see worker/registry.py)
-    by name, with JSON-safe positional/keyword arguments.
+def execute_registered(operation: str, payload: dict):
+    """Phase 10.2: invoke a pre-registered function (see worker/registry.py)
+    by operation name, calling it as fn(**payload) -- the task's payload
+    IS the function's keyword arguments, directly off the JSON-decoded
+    wire message, no positional-args/kwargs wrapper to design or get
+    wrong.
 
     Three distinct failure modes, all reported the same controlled way
     (ExecutionError -> {"status": "error", ...}, never an unhandled
     exception that could crash the worker process):
-      - contract violations (missing/malformed 'function'/'args'/'kwargs')
+      - payload isn't an object (can't be spread as keyword arguments)
       - the function's OWN exception (wrapped with its type name so the
         caller can tell "my function raised ValueError" from "the
-        contract itself was violated")
+        contract itself was violated") -- this also naturally covers
+        wrong/missing arguments, which surface as Python's own TypeError
       - a return value that can't survive the JSON wire protocol -- caught
         HERE, on the worker, rather than failing confusingly deep inside
         send_message on the way out.
     """
-    name = payload.get("function")
-    args = payload.get("args", [])
-    kwargs = payload.get("kwargs", {})
-
-    if not isinstance(name, str) or not name:
-        raise ExecutionError("payload must contain a non-empty string field 'function'")
-    if not isinstance(args, list):
-        raise ExecutionError("payload field 'args' must be a list")
-    if not isinstance(kwargs, dict):
-        raise ExecutionError("payload field 'kwargs' must be an object")
-
-    fn = registry.get_function(name)
+    fn = registry.get_function(operation)
     if fn is None:
-        raise ExecutionError(f"Unknown registered function: {name}")
+        raise ExecutionError(f"Unsupported task type: {operation}")
+
+    if not isinstance(payload, dict):
+        raise ExecutionError("payload must be an object of keyword arguments")
 
     try:
-        result = fn(*args, **kwargs)
+        result = fn(**payload)
     except Exception as exc:
         raise ExecutionError(f"{type(exc).__name__}: {exc}") from exc
 
     try:
         json.dumps(result)
     except (TypeError, ValueError) as exc:
-        raise ExecutionError(f"Return value of {name!r} is not JSON-serializable: {exc}") from exc
+        raise ExecutionError(f"Return value of {operation!r} is not JSON-serializable: {exc}") from exc
 
     return result
 
@@ -152,17 +147,24 @@ HANDLERS = {
     MULTIPLY: execute_multiply,
     MAP: execute_map,
     REDUCE: execute_reduce,
-    CALL: execute_call,
 }
 
 
 def execute_task(task_type: str, payload: dict) -> dict:
+    """Built-in operations (HANDLERS) take priority; a task_type that
+    isn't one of them falls back to worker.registry -- a task_type IS an
+    operation name either way, whether it's a fixed vocabulary entry or a
+    user-registered function (Phase 10.2), so both resolve through this
+    one entry point rather than needing a caller to know which kind of
+    operation they're submitting.
+    """
     handler = HANDLERS.get(task_type)
-    if handler is None:
-        return {"status": "error", "message": f"Unsupported task type: {task_type}"}
 
     try:
-        result = handler(payload)
+        if handler is not None:
+            result = handler(payload)
+        else:
+            result = execute_registered(task_type, payload)
     except ExecutionError as exc:
         return {"status": "error", "message": str(exc)}
 

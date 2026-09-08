@@ -48,8 +48,8 @@ def test_register_empty_name_raises():
         registry.register_function("", lambda: None)
 
 
-def test_registered_decorator():
-    @registry.registered("cube")
+def test_register_decorator():
+    @registry.register("cube")
     def cube(x):
         return x * x * x
 

@@ -1,10 +1,12 @@
-"""Phase 10.1: CALL tasks proven end-to-end over the real async transport --
-a registered function submitted via jobs.call.submit_call, dispatched to a
-real worker process (well, coroutine, but a separate connection/registration
-just like a real one) through master.async_server's existing Scheduler /
-dispatch_assigned_task / wait_for_tasks, exactly like ADD or MULTIPLY. No
-CALL-specific dispatch logic exists anywhere -- this file is what proves
-that's actually true, not just true by design intent.
+"""Phase 10.2: registered-function tasks proven end-to-end over the real
+async transport -- a function registered via worker.registry, submitted
+via jobs.call.submit_call, dispatched to a real worker process (well,
+coroutine, but a separate connection/registration just like a real one)
+through master.async_server's existing Scheduler / dispatch_assigned_task
+/ wait_for_tasks, exactly like ADD or MULTIPLY. No CALL-specific dispatch
+logic exists anywhere -- a registered operation's task_type is its own
+name -- and this file is what proves that's actually true, not just true
+by design intent.
 """
 
 import asyncio
@@ -40,7 +42,7 @@ async def stop_worker(task: asyncio.Task) -> None:
         pass
 
 
-def test_call_task_dispatched_to_a_real_worker_and_executed():
+def test_registered_function_dispatched_to_a_real_worker_and_executed():
     def fibonacci(n):
         a, b = 0, 1
         for _ in range(n):
@@ -55,7 +57,7 @@ def test_call_task_dispatched_to_a_real_worker_and_executed():
         await async_server.wait_for_workers(1)
 
         try:
-            task = submit_call(async_server.scheduler, "fib-10", "fibonacci", args=[10])
+            task = submit_call(async_server.scheduler, "fib-10", "fibonacci", n=10)
             [response] = await async_server.wait_for_tasks({task.task_id})
             return response
         finally:
@@ -67,7 +69,7 @@ def test_call_task_dispatched_to_a_real_worker_and_executed():
     assert collect_call_result(response) == 55
 
 
-def test_call_task_with_kwargs_dispatched_to_a_real_worker():
+def test_registered_function_with_multiple_keyword_arguments():
     registry.register_function("greet", lambda name, greeting="Hello": f"{greeting}, {name}!")
 
     async def scenario():
@@ -76,9 +78,7 @@ def test_call_task_with_kwargs_dispatched_to_a_real_worker():
         await async_server.wait_for_workers(1)
 
         try:
-            task = submit_call(
-                async_server.scheduler, "greet-1", "greet", args=["Ada"], kwargs={"greeting": "Hi"}
-            )
+            task = submit_call(async_server.scheduler, "greet-1", "greet", name="Ada", greeting="Hi")
             [response] = await async_server.wait_for_tasks({task.task_id})
             return response
         finally:
@@ -90,7 +90,7 @@ def test_call_task_with_kwargs_dispatched_to_a_real_worker():
     assert collect_call_result(response) == "Hi, Ada!"
 
 
-def test_call_task_failure_surfaces_through_collect_call_result():
+def test_registered_function_failure_surfaces_through_collect_call_result():
     def picky(x):
         if x < 0:
             raise ValueError("x must be non-negative")
@@ -104,7 +104,7 @@ def test_call_task_failure_surfaces_through_collect_call_result():
         await async_server.wait_for_workers(1)
 
         try:
-            task = submit_call(async_server.scheduler, "picky-1", "picky", args=[-5])
+            task = submit_call(async_server.scheduler, "picky-1", "picky", x=-5)
             [response] = await async_server.wait_for_tasks({task.task_id})
             return response
         finally:
@@ -117,7 +117,7 @@ def test_call_task_failure_surfaces_through_collect_call_result():
         collect_call_result(response)
 
 
-def test_multiple_call_tasks_share_worker_pool_like_any_other_task_type():
+def test_multiple_registered_function_tasks_share_worker_pool_like_any_other_task_type():
     registry.register_function("square", lambda x: x * x)
 
     async def scenario():
@@ -128,7 +128,7 @@ def test_multiple_call_tasks_share_worker_pool_like_any_other_task_type():
         await async_server.wait_for_workers(2)
 
         try:
-            tasks = [submit_call(async_server.scheduler, f"sq-{i}", "square", args=[i]) for i in range(5)]
+            tasks = [submit_call(async_server.scheduler, f"sq-{i}", "square", x=i) for i in range(5)]
             responses = await async_server.wait_for_tasks({t.task_id for t in tasks})
             return {r["payload"]["task_id"]: collect_call_result(r) for r in responses}
         finally:
