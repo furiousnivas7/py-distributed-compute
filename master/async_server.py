@@ -101,6 +101,16 @@ _dispatcher_task: asyncio.Task | None = None
 _dispatcher_stop_event: asyncio.Event | None = None
 _dispatcher_event_loop: asyncio.AbstractEventLoop | None = None
 
+# Phase 9.3 -- every dispatch_assigned_task task dispatcher_loop spawns is
+# tracked here (added on creation, self-removing via add_done_callback) so
+# stop_dispatcher() can await them instead of leaving them to finish on
+# their own after the loop that spawned them has already stopped. Without
+# this, a master stop/start cycle could accumulate orphaned tasks over
+# repeated cycles -- individually harmless (fail_pending() resolves them
+# quickly once their connection closes) but real leaks under the exact
+# "stop and restart the runtime repeatedly" scenario Phase 9.3 cares about.
+_dispatch_tasks: set[asyncio.Task] = set()
+
 
 def _record_task_response(task_id: str, response: dict) -> None:
     """Record a task's terminal outcome and resolve anyone awaiting it.
@@ -572,7 +582,9 @@ async def dispatcher_loop(stop_event: asyncio.Event, poll_interval: float = 0.01
             task = scheduler.assign_next_pending_task()
             if task is None:
                 break
-            asyncio.create_task(dispatch_assigned_task(task))
+            spawned = asyncio.create_task(dispatch_assigned_task(task))
+            _dispatch_tasks.add(spawned)
+            spawned.add_done_callback(_dispatch_tasks.discard)
 
 
 def is_dispatcher_running() -> bool:
@@ -604,13 +616,23 @@ def ensure_dispatcher_running() -> None:
 
 
 async def stop_dispatcher() -> None:
-    """Stop the dispatcher started by ensure_dispatcher_running(), if any is running here."""
+    """Stop the dispatcher started by ensure_dispatcher_running(), if any
+    is running here, and wait for every dispatch task it ever spawned
+    (see _dispatch_tasks) to actually finish -- not just for the loop
+    itself to stop picking up NEW work. Those tasks run independently of
+    dispatcher_loop once created, so stopping the loop alone would leave
+    them to resolve on their own time; callers that need "the dispatcher
+    is fully quiesced, nothing of mine is still running" (Phase 9.3
+    master shutdown) need this stronger guarantee.
+    """
     global _dispatcher_task
     if not is_dispatcher_running():
         return
     _dispatcher_stop_event.set()
     await _dispatcher_task
     _dispatcher_task = None
+    if _dispatch_tasks:
+        await asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
 
 async def wait_for_tasks(task_ids: set[str], timeout: float = 30.0) -> list[dict]:
@@ -704,14 +726,118 @@ async def wait_for_workers(count: int, poll_interval: float = 0.01) -> None:
         await asyncio.sleep(poll_interval)
 
 
+# Phase 9.3 -- master runtime lifecycle. Distinct from worker lifecycle
+# (Phase 9.2): a worker shutting down is one participant leaving in an
+# orderly way; the master shutting down is the whole runtime -- accepting
+# connections, the dispatcher, the failure monitor, every open worker
+# connection -- coming down together, deterministically, and leaving
+# nothing leaked behind for a possible later restart.
+_server: asyncio.base_events.Server | None = None
+_master_failure_monitor_task: asyncio.Task | None = None
+_master_failure_monitor_stop_event: asyncio.Event | None = None
+_master_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def is_master_running() -> bool:
+    """Whether the master runtime is active on the CURRENT event loop.
+
+    Mirrors is_dispatcher_running()'s same reasoning: each test (and each
+    real process) runs its own asyncio.run(), so a `_server` left over
+    from an earlier, now-closed loop (e.g. a caller that started the
+    master and let its loop end without calling stop_master()) is
+    meaningless here -- worse, actually touching it (closing it, awaiting
+    its already-dead failure-monitor task) from a DIFFERENT loop raises
+    CancelledError/RuntimeError, since asyncio objects aren't valid across
+    event loops. Comparing against the loop the server was actually
+    created on is what makes this (and start_master/stop_master, which
+    both call this) safe from a fresh loop without confusing a stale
+    reference for "still running".
+    """
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return _server is not None and _master_event_loop is running_loop
+
+
+async def start_master(host: str = HOST, port: int = PORT) -> asyncio.base_events.Server:
+    """Idempotently start accepting worker connections and the failure
+    monitor. Returns the existing server unchanged if already running,
+    rather than starting a second one alongside it."""
+    global _server, _master_failure_monitor_task, _master_failure_monitor_stop_event, _master_event_loop
+    if is_master_running():
+        return _server
+
+    _server = await asyncio.start_server(handle_worker_connection, host, port)
+    _master_event_loop = asyncio.get_running_loop()
+    _master_failure_monitor_stop_event = asyncio.Event()
+    _master_failure_monitor_task = asyncio.create_task(failure_monitor(_master_failure_monitor_stop_event))
+    return _server
+
+
+async def stop_master() -> None:
+    """Idempotently shut down everything start_master() started, in an
+    order chosen so nothing already stopped can still act on what a later
+    step does:
+
+    1. Stop accepting new worker connections (server.close()) first --
+       nothing new should be able to join a runtime that's shutting down.
+    2. Stop the dispatcher, and wait for every dispatch it already spawned
+       to actually finish (see stop_dispatcher) -- no new assignment can
+       happen after this.
+    3. Stop the failure monitor -- with the dispatcher already stopped,
+       its drain_pending_tasks() fallback would otherwise be the only
+       thing left that could still assign work during shutdown.
+    4/5. Close every currently-open worker connection. Whatever was still
+       in flight on one fails through the exact same ConnectionError path
+       a real crash takes (requeued, worker marked FAILED) -- shutdown
+       doesn't invent a special "cancelled" outcome, it just removes
+       every reason such a failure could ever be retried, since nothing
+       is left running to pick the requeued task back up.
+    6. Give those connections' own handle_worker_connection cleanup a
+       bounded chance to finish (in particular, a DRAINING worker's clean
+       STOPPED reclassification) before forcibly clearing `connections`
+       as a safety net against anything that didn't get scheduled in time.
+    7. Clear the response registry (_task_responses/_task_futures) so no
+       stale entry can leak into a later start_master() cycle and
+       resolve some future, unrelated task's wait_for_tasks() call with
+       the wrong data.
+
+    Safe to call when nothing is running (no-op) or more than once in a
+    row (idempotent) -- matching start_master().
+    """
+    global _server, _master_failure_monitor_task, _master_failure_monitor_stop_event, _master_event_loop
+    if not is_master_running():
+        return
+
+    _server.close()
+    await _server.wait_closed()
+    _server = None
+    _master_event_loop = None
+
+    await stop_dispatcher()
+
+    _master_failure_monitor_stop_event.set()
+    await _master_failure_monitor_task
+    _master_failure_monitor_task = None
+    _master_failure_monitor_stop_event = None
+
+    for link in list(connections.values()):
+        await link.conn.close()
+
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while connections and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    connections.clear()
+
+    clear_dispatch_registry()
+
+
 async def run_server() -> None:
-    server = await asyncio.start_server(handle_worker_connection, HOST, PORT)
+    await start_master()
     print(f"Async master started on {HOST}:{PORT}")
 
-    stop_event = asyncio.Event()
-    monitor_task = asyncio.create_task(failure_monitor(stop_event))
-
-    async with server:
+    try:
         await wait_for_workers(EXPECTED_WORKERS)
 
         demo_tasks = [
@@ -726,16 +852,12 @@ async def run_server() -> None:
             task_ids.add(task_id)
 
         await wait_for_tasks(task_ids)
-        await stop_dispatcher()
 
         print("Final task states:")
         for task in scheduler.get_all_tasks():
             print(f"  {task.task_id}: {task.status} (worker={task.assigned_worker_id})")
-
-        stop_event.set()
-        await monitor_task
-        server.close()
-        await server.wait_closed()
+    finally:
+        await stop_master()
 
 
 def main() -> None:
