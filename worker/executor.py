@@ -1,9 +1,14 @@
 """Executes tasks on the worker and produces a result payload."""
 
+import json
+
+from worker import registry
+
 ADD = "ADD"
 MULTIPLY = "MULTIPLY"
 MAP = "MAP"
 REDUCE = "REDUCE"
+CALL = "CALL"
 
 # Named operations only -- no arbitrary Python function serialization.
 # Keeps the wire protocol a fixed, deterministic vocabulary rather than
@@ -90,6 +95,49 @@ def execute_reduce(payload: dict):
     return REDUCE_OPERATIONS[operation](values)
 
 
+def execute_call(payload: dict):
+    """Phase 10.1: invoke a pre-registered function (see worker/registry.py)
+    by name, with JSON-safe positional/keyword arguments.
+
+    Three distinct failure modes, all reported the same controlled way
+    (ExecutionError -> {"status": "error", ...}, never an unhandled
+    exception that could crash the worker process):
+      - contract violations (missing/malformed 'function'/'args'/'kwargs')
+      - the function's OWN exception (wrapped with its type name so the
+        caller can tell "my function raised ValueError" from "the
+        contract itself was violated")
+      - a return value that can't survive the JSON wire protocol -- caught
+        HERE, on the worker, rather than failing confusingly deep inside
+        send_message on the way out.
+    """
+    name = payload.get("function")
+    args = payload.get("args", [])
+    kwargs = payload.get("kwargs", {})
+
+    if not isinstance(name, str) or not name:
+        raise ExecutionError("payload must contain a non-empty string field 'function'")
+    if not isinstance(args, list):
+        raise ExecutionError("payload field 'args' must be a list")
+    if not isinstance(kwargs, dict):
+        raise ExecutionError("payload field 'kwargs' must be an object")
+
+    fn = registry.get_function(name)
+    if fn is None:
+        raise ExecutionError(f"Unknown registered function: {name}")
+
+    try:
+        result = fn(*args, **kwargs)
+    except Exception as exc:
+        raise ExecutionError(f"{type(exc).__name__}: {exc}") from exc
+
+    try:
+        json.dumps(result)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionError(f"Return value of {name!r} is not JSON-serializable: {exc}") from exc
+
+    return result
+
+
 def _require_numbers(payload: dict):
     a = payload.get("a")
     b = payload.get("b")
@@ -104,6 +152,7 @@ HANDLERS = {
     MULTIPLY: execute_multiply,
     MAP: execute_map,
     REDUCE: execute_reduce,
+    CALL: execute_call,
 }
 
 
