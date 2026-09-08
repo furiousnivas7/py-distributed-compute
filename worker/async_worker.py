@@ -173,6 +173,16 @@ async def run_worker(
     (e.g. a crash, or the process being killed) still controls."""
     if backend is None:
         backend = DirectBackend()
+    elif not isinstance(backend, ExecutionBackend):
+        # Phase 11.3: reject clearly and immediately -- before opening any
+        # connection or touching the network at all -- rather than
+        # failing confusingly later (an AttributeError from `backend.
+        # start()`, or worse, silently doing nothing useful if the object
+        # happens to have SOME but not all of the right method names).
+        raise TypeError(
+            f"backend must be an ExecutionBackend instance (or None for the "
+            f"default DirectBackend), got {type(backend).__name__}"
+        )
 
     reader, writer = await asyncio.open_connection(master_host, master_port)
     conn = AsyncConnection(reader, writer)
@@ -182,32 +192,51 @@ async def run_worker(
     heartbeat_task = None
     shutdown_watcher = None
 
-    await backend.start()
+    # Phase 11.3: backend.start()/stop() lifecycle is made deterministic
+    # against failure at every stage, not just the happy path already
+    # covered by Phase 11.1/11.2's tests:
+    #   - start() failing must still close `conn` (the outer `finally`
+    #     below) -- and gets a matching stop() attempt (see the inner
+    #     except immediately below) in case start() partially initialized
+    #     something before failing; every backend.stop() implementation
+    #     so far tolerates being called on a backend that never fully
+    #     started (DirectBackend has no state at all; MultiprocessingBackend
+    #     checks `self._pool is None` and no-ops).
+    #   - stop() failing (whether following a normal run or a failed
+    #     start()) must not prevent `conn.close()` from still running.
     try:
-        ping_response = await send_request(conn, protocol.PING)
-        print(f"Status: {ping_response['payload'].get('status')}")
+        try:
+            await backend.start()
+        except Exception:
+            await backend.stop()
+            raise
 
-        register_response = await register(conn, worker_id, worker_host, worker_port)
-        print(f"Status: {register_response['payload'].get('status')}")
+        try:
+            ping_response = await send_request(conn, protocol.PING)
+            print(f"Status: {ping_response['payload'].get('status')}")
 
-        heartbeat_task = asyncio.create_task(
-            start_heartbeat_loop(conn, worker_id, stop_heartbeat, heartbeat_interval)
-        )
-        if shutdown_event is not None:
-            shutdown_watcher = asyncio.create_task(watch_for_shutdown(conn, worker_id, shutdown_event))
+            register_response = await register(conn, worker_id, worker_host, worker_port)
+            print(f"Status: {register_response['payload'].get('status')}")
 
-        await serve_tasks(conn, backend)
+            heartbeat_task = asyncio.create_task(
+                start_heartbeat_loop(conn, worker_id, stop_heartbeat, heartbeat_interval)
+            )
+            if shutdown_event is not None:
+                shutdown_watcher = asyncio.create_task(watch_for_shutdown(conn, worker_id, shutdown_event))
+
+            await serve_tasks(conn, backend)
+        finally:
+            stop_heartbeat.set()
+            if heartbeat_task is not None:
+                await heartbeat_task
+            if shutdown_watcher is not None:
+                shutdown_watcher.cancel()
+                try:
+                    await shutdown_watcher
+                except asyncio.CancelledError:
+                    pass
+            await backend.stop()
     finally:
-        stop_heartbeat.set()
-        if heartbeat_task is not None:
-            await heartbeat_task
-        if shutdown_watcher is not None:
-            shutdown_watcher.cancel()
-            try:
-                await shutdown_watcher
-            except asyncio.CancelledError:
-                pass
-        await backend.stop()
         await conn.close()
 
 
