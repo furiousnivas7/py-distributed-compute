@@ -263,3 +263,33 @@ def test_stop_master_lets_a_draining_worker_finish_reclassifying_to_stopped():
 
     status = asyncio.run(scenario())
     assert status == WorkerStatus.STOPPED
+
+
+def test_stop_master_gives_a_caller_blocked_in_wait_for_tasks_a_deterministic_outcome():
+    """A caller mid-await inside wait_for_tasks() when stop_master() runs
+    must not be left hanging forever -- clear_dispatch_registry()
+    (stop_master()'s last step) cancels any still-pending future in
+    _task_futures, so the caller's own `await asyncio.gather(*futures)`
+    raises CancelledError rather than never returning.
+
+    Follow-up noted for a later phase: a dedicated shutdown exception (or
+    terminal status) would let a caller distinguish "the master shut down
+    while I was waiting" from an ordinary external cancellation of its own
+    task, which a bare CancelledError can't. Not addressed here -- this
+    test only locks in the more basic, currently-true guarantee: shutdown
+    resolves every pending waiter one way or another, it never leaves one
+    stuck."""
+
+    async def scenario():
+        await async_server.start_master(port=0)
+        task = async_server.scheduler.submit_task("t1", "ADD", {"a": 1, "b": 1})
+        waiter = asyncio.create_task(async_server.wait_for_tasks({task.task_id}))
+        await asyncio.sleep(0.1)
+        assert not waiter.done()
+
+        await async_server.stop_master()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, timeout=3)
+
+    asyncio.run(scenario())
