@@ -99,3 +99,19 @@ def test_a_custom_backend_can_override_only_execute():
 
     result = asyncio.run(scenario())
     assert result == {"status": "success", "result": "HELLO"}
+
+
+def test_direct_backend_max_concurrency_is_none_unchanged_for_compatibility():
+    """Phase 11.4: DirectBackend imposes no artificial concurrency limit
+    of its own -- keeping it unchanged for compatibility (per Phase 11.4
+    scope) rather than adding a semaphore/thread-offload wrapper it never
+    needed before."""
+    assert DirectBackend().max_concurrency is None
+
+
+def test_execution_backend_base_max_concurrency_defaults_to_none():
+    class Minimal(ExecutionBackend):
+        async def execute(self, task_type: str, payload: dict) -> dict:
+            return {"status": "success", "result": None}
+
+    assert Minimal().max_concurrency is None

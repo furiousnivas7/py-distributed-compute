@@ -209,3 +209,70 @@ def test_child_process_death_is_treated_as_worker_failure_and_the_task_is_requeu
     assert task.status == TaskStatus.PENDING
     assert task.assigned_worker_id is None
     assert task.attempt == 1
+
+
+# -- Phase 11.4: resource/concurrency controls, full pipeline ---------
+
+
+def test_full_worker_master_integration_under_concurrency_limits():
+    """A real worker, real master, real dispatched tasks -- with BOTH
+    max_workers and max_in_flight configured -- must still process every
+    task correctly. Concurrency controls are a backend-internal resource
+    concern; they must not change what a caller sees on the wire."""
+    registry.register_function("square", lambda x: x * x)
+
+    async def scenario():
+        server, host, port = await start_master_server()
+        backend = MultiprocessingBackend(max_workers=2, max_in_flight=2)
+        worker_task = asyncio.create_task(
+            async_worker.run_worker(host, port, worker_id="worker-1", backend=backend)
+        )
+        await async_server.wait_for_workers(1)
+
+        try:
+            tasks = [
+                async_server.scheduler.submit_task(f"sq-{i}", "square", {"x": i}) for i in range(5)
+            ]
+            responses = await async_server.wait_for_tasks({t.task_id for t in tasks})
+            return {r["payload"]["task_id"]: r["payload"]["result"] for r in responses}
+        finally:
+            await stop_worker(worker_task)
+            server.close()
+            await server.wait_closed()
+
+    results = asyncio.run(scenario())
+    assert results == {f"sq-{i}": i * i for i in range(5)}
+
+
+def test_heartbeat_remains_responsive_under_max_in_flight_limit():
+    """The in-flight semaphore must not itself become a source of
+    unresponsiveness -- a worker configured with a tight max_in_flight,
+    executing a real CPU-bound task, must still send HEARTBEAT on
+    schedule (mirrors test_heartbeats_continue_arriving_during_a_real_cpu_bound_dispatch,
+    with concurrency limits configured this time)."""
+    registry.register_function("slow_double", _slow_double)
+
+    async def scenario():
+        server, host, port = await start_master_server()
+        backend = MultiprocessingBackend(max_workers=2, max_in_flight=1)
+        worker_task = asyncio.create_task(
+            async_worker.run_worker(
+                host, port, worker_id="worker-1", backend=backend, heartbeat_interval=0.1
+            )
+        )
+        await async_server.wait_for_workers(1)
+
+        try:
+            before = async_server.worker_manager.get_worker("worker-1").last_heartbeat
+            task = async_server.scheduler.submit_task("t1", "slow_double", {"x": 5})
+            [response] = await async_server.wait_for_tasks({task.task_id})
+            after = async_server.worker_manager.get_worker("worker-1").last_heartbeat
+            return response, before, after
+        finally:
+            await stop_worker(worker_task)
+            server.close()
+            await server.wait_closed()
+
+    response, before, after = asyncio.run(scenario())
+    assert response["payload"]["result"] == 10
+    assert after > before

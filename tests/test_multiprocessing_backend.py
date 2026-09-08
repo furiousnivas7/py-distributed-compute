@@ -302,3 +302,186 @@ def test_serialized_callable_is_portable_under_spawn_not_just_fork():
 
     result = asyncio.run(scenario())
     assert result == {"status": "success", "result": 42}
+
+
+# -- Phase 11.4: resource and concurrency controls --------------------
+
+
+def _sleep_briefly():
+    time.sleep(0.3)
+    return "done"
+
+
+def test_max_workers_zero_is_rejected():
+    with pytest.raises(ValueError, match="max_workers"):
+        MultiprocessingBackend(max_workers=0)
+
+
+def test_max_workers_negative_is_rejected():
+    with pytest.raises(ValueError, match="max_workers"):
+        MultiprocessingBackend(max_workers=-1)
+
+
+def test_max_in_flight_zero_is_rejected():
+    with pytest.raises(ValueError, match="max_in_flight"):
+        MultiprocessingBackend(max_workers=2, max_in_flight=0)
+
+
+def test_max_in_flight_negative_is_rejected():
+    with pytest.raises(ValueError, match="max_in_flight"):
+        MultiprocessingBackend(max_workers=2, max_in_flight=-3)
+
+
+def test_max_workers_none_and_max_in_flight_none_are_still_accepted():
+    """The explicit, documented defaults -- unbounded/delegate-to-pool --
+    must not be rejected by the same validation that rejects 0/negative."""
+    backend = MultiprocessingBackend()  # must not raise
+    assert backend.max_concurrency is None
+
+
+def test_process_pool_uses_the_configured_max_workers():
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=3)
+        await backend.start()
+        try:
+            return backend._pool._max_workers
+        finally:
+            await backend.stop()
+
+    assert asyncio.run(scenario()) == 3
+
+
+def test_max_concurrency_metadata_reflects_max_in_flight_when_set():
+    backend = MultiprocessingBackend(max_workers=4, max_in_flight=2)
+    assert backend.max_concurrency == 2
+
+
+def test_max_concurrency_metadata_falls_back_to_max_workers():
+    backend = MultiprocessingBackend(max_workers=4)
+    assert backend.max_concurrency == 4
+
+
+def test_maximum_number_of_simultaneously_executing_tasks_is_bounded_by_max_workers():
+    """Timing-based proof (matching Phase 11.2's own event-loop test
+    style): 4 tasks that each take ~0.3s, with only 2 real worker
+    processes, must take roughly 2 rounds (~0.6s+), not 1 round (~0.3s,
+    which would mean more than 2 ran truly in parallel) or 4 rounds
+    (~1.2s, which would mean none ran in parallel at all)."""
+    registry.register_function("slow", _sleep_briefly)
+
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=2)
+        await backend.start()
+        try:
+            start = time.monotonic()
+            await asyncio.gather(*(backend.execute("slow", {}) for _ in range(4)))
+            return time.monotonic() - start
+        finally:
+            await backend.stop()
+
+    elapsed = asyncio.run(scenario())
+    assert elapsed > 0.5, f"completed too fast ({elapsed:.2f}s) for only 2 real worker processes"
+    assert elapsed < 1.0, f"completed too slow ({elapsed:.2f}s) -- looks fully serialized, not parallel"
+
+
+def test_max_in_flight_limits_concurrent_submissions_to_the_pool():
+    """Precise, non-timing-based proof of the semaphore's own gating:
+    _submit is stubbed out (no real multiprocessing overhead/timing
+    noise) to directly count how many are concurrently past the
+    semaphore at once."""
+
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=4, max_in_flight=2)
+        await backend.start()
+
+        active = 0
+        max_active = 0
+
+        async def fake_submit(task_type, payload):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.05)
+            active -= 1
+            return {"status": "success", "result": "ok"}
+
+        backend._submit = fake_submit
+        try:
+            await asyncio.gather(*(backend.execute("x", {}) for _ in range(6)))
+        finally:
+            await backend.stop()
+        return max_active
+
+    max_active = asyncio.run(scenario())
+    assert max_active == 2
+
+
+def test_semaphore_permit_is_released_after_successful_execution():
+    """With max_in_flight=1, running several tasks SEQUENTIALLY (one
+    completes before the next starts) must never deadlock -- proving the
+    permit is released each time, not just acquired once and never
+    freed."""
+    registry.register_function("noop", lambda: "ok")
+
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=2, max_in_flight=1)
+        await backend.start()
+        try:
+            results = []
+            for _ in range(3):
+                results.append(await asyncio.wait_for(backend.execute("noop", {}), timeout=5))
+            return results
+        finally:
+            await backend.stop()
+
+    results = asyncio.run(scenario())
+    assert results == [{"status": "success", "result": "ok"}] * 3
+
+
+def test_semaphore_permit_is_released_after_execution_failure():
+    """The permit must be released even when the task ITSELF fails (a
+    normal execution failure, still returns a result dict, doesn't
+    raise) -- otherwise one failing task would permanently starve every
+    later one under a tight max_in_flight."""
+    registry.register_function("boom", _raise_value_error)
+    registry.register_function("noop", lambda: "ok")
+
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=2, max_in_flight=1)
+        await backend.start()
+        try:
+            first = await asyncio.wait_for(backend.execute("boom", {}), timeout=5)
+            second = await asyncio.wait_for(backend.execute("noop", {}), timeout=5)
+            return first, second
+        finally:
+            await backend.stop()
+
+    first, second = asyncio.run(scenario())
+    assert first["status"] == "error"
+    assert second == {"status": "success", "result": "ok"}
+
+
+def test_shutdown_while_tasks_are_queued_in_the_pool_does_not_hang():
+    """max_workers=1 means only the FIRST of several concurrently-
+    submitted tasks can actually be running at once; the rest sit
+    queued inside the pool itself. Calling stop() while they're still
+    queued must not hang, and must resolve every outstanding execute()
+    call one way or another (result or exception) rather than leaving
+    any of them pending forever."""
+    registry.register_function("slow", _sleep_briefly)
+
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=1)
+        await backend.start()
+
+        exec_tasks = [asyncio.create_task(backend.execute("slow", {})) for _ in range(3)]
+        await asyncio.sleep(0.05)  # let the first one actually start running
+
+        await asyncio.wait_for(backend.stop(), timeout=5)
+
+        return await asyncio.gather(*exec_tasks, return_exceptions=True)
+
+    results = asyncio.run(scenario())
+    assert len(results) == 3
+    for result in results:
+        assert result is not None  # every call resolved somehow, none left pending
