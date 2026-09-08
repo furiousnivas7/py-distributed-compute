@@ -14,6 +14,7 @@ This project is designed to explore the fundamentals of distributed systems, cus
 - Asynchronous communication using `asyncio`
 - Parallel task execution using `multiprocessing`
 - MapReduce programming model
+- Remote execution of registered functions and serialized Python callables
 - Task scheduling and load distribution
 - Worker heartbeat monitoring
 - Failed-task detection and retry
@@ -272,6 +273,31 @@ Output:
 404: 832
 500: 47
 ```
+
+## Security Considerations
+
+**Serialized callables are executable code, not data.** The engine supports
+submitting an arbitrary Python function (`jobs.call.submit_serialized_call`,
+`jobs.map.build_map_job_serialized`, `jobs.reduce.build_reduce_job_serialized`)
+by serializing it with `cloudpickle` and shipping it to a worker, which
+deserializes and calls it. A worker that accepts and runs one is trusting
+whatever produced it exactly as much as it trusts its own source code --
+this is remote code execution by design, not a bug or an oversight.
+
+That is an acceptable, deliberate trade-off for a cooperative cluster
+where every master and worker is operated by the same trusted party (this
+project's scope throughout). It is **not** safe to expose to, or accept
+submissions from, an untrusted client or network. If a deployment ever
+needs to run code from a submitter it doesn't fully trust, that requires
+actual process/OS-level sandboxing of the worker -- not a check anywhere
+in this codebase, and not something planned here. See
+`worker/serialization.py`'s module docstring for the full rationale.
+
+The registered-function path (`worker.registry`, `jobs.call.submit_call`)
+does not have this exposure: only functions a worker operator already
+chose to import and register can run, regardless of what a task's
+payload contains -- a task can select *which* registered function runs
+and *what arguments* it receives, never *what code* runs.
 
 ## Fault Tolerance
 

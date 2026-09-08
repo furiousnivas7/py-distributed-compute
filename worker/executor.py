@@ -118,48 +118,125 @@ def execute_multiply(payload: dict):
 
 
 def execute_map(payload: dict):
-    operation = payload.get("operation")
+    """Built-in MAP_OPERATIONS keep their exact original behavior
+    (strict numeric/non-empty-string validation per element) unchanged.
+
+    Phase 10.5: an `operation` that isn't a built-in falls back to
+    worker.registry, same as execute_registered -- reusing the SAME
+    build_map_job(scheduler, job_id, operation, data, num_partitions)
+    a caller already uses for built-ins; only the operation NAME has to
+    be a registered function's name instead. No per-element type
+    restriction is imposed for a registered/serialized function -- unlike
+    the built-ins, we don't know in advance what it expects -- so a
+    per-element failure (wrong type, an exception) surfaces as
+    USER_FUNCTION_ERROR rather than a generic MAP validation error.
+
+    `execution_mode: "serialized_callable"` (alongside `callable`, same
+    field as the EXECUTE envelope) selects an arbitrary serialized
+    callable instead of any name lookup -- see jobs.map.build_map_job_serialized.
+    """
     data = payload.get("data")
-
-    if operation not in MAP_OPERATIONS:
-        raise ExecutionError(f"Unsupported MAP operation: {operation}", code=ExecutionErrorCode.UNKNOWN_OPERATION)
-
     if not isinstance(data, list):
         raise ExecutionError("payload must contain a list field 'data'")
 
-    fn = MAP_OPERATIONS[operation]
+    if payload.get("execution_mode") == "serialized_callable":
+        fn = _deserialize_callable_field(payload)
+        mapped = _apply_to_each(fn, data)
+        _check_result_is_json_safe(mapped, "MAP(serialized_callable)")
+        return mapped
 
-    if operation in KEY_VALUE_MAP_OPERATIONS:
+    operation = payload.get("operation")
+
+    if operation in MAP_OPERATIONS:
+        fn = MAP_OPERATIONS[operation]
+
+        if operation in KEY_VALUE_MAP_OPERATIONS:
+            mapped = []
+            for value in data:
+                if not isinstance(value, str) or not value:
+                    raise ExecutionError(f"{operation} data must contain only non-empty strings")
+                mapped.append(fn(value))
+            return mapped
+
         mapped = []
         for value in data:
-            if not isinstance(value, str) or not value:
-                raise ExecutionError(f"{operation} data must contain only non-empty strings")
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ExecutionError("MAP data must contain only numeric values")
             mapped.append(fn(value))
         return mapped
 
-    mapped = []
-    for value in data:
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise ExecutionError("MAP data must contain only numeric values")
-        mapped.append(fn(value))
+    fn = registry.get_function(operation)
+    if fn is None:
+        raise ExecutionError(f"Unsupported MAP operation: {operation}", code=ExecutionErrorCode.UNKNOWN_OPERATION)
+
+    mapped = _apply_to_each(fn, data)
+    _check_result_is_json_safe(mapped, operation)
     return mapped
 
 
+def _apply_to_each(fn, data: list) -> list:
+    mapped = []
+    for value in data:
+        try:
+            mapped.append(fn(value))
+        except Exception as exc:
+            raise ExecutionError(
+                f"{type(exc).__name__}: {exc}", code=ExecutionErrorCode.USER_FUNCTION_ERROR
+            ) from exc
+    return mapped
+
+
+def _deserialize_callable_field(payload: dict):
+    encoded = payload.get("callable")
+    if not isinstance(encoded, str) or not encoded:
+        raise ExecutionError("payload must contain a non-empty string field 'callable'")
+    try:
+        return serialization.deserialize_callable(serialization.decode_from_wire(encoded))
+    except serialization.SerializationError as exc:
+        raise ExecutionError(str(exc), code=ExecutionErrorCode.DESERIALIZATION_FAILED) from exc
+
+
 def execute_reduce(payload: dict):
-    operation = payload.get("operation")
+    """Built-in REDUCE_OPERATIONS keep their exact original behavior
+    (strict numeric validation, whole-list REDUCE_OPERATIONS[operation](values))
+    unchanged. Phase 10.5 extends this the same way execute_map is
+    extended -- see its docstring -- except a registered/serialized
+    REDUCE function receives the WHOLE `values` list in one call
+    (fn(values)), matching REDUCE_OPERATIONS' own aggregate calling
+    convention (e.g. sum, len), not one call per element like MAP.
+    """
     values = payload.get("values")
-
-    if operation not in REDUCE_OPERATIONS:
-        raise ExecutionError(f"Unsupported REDUCE operation: {operation}", code=ExecutionErrorCode.UNKNOWN_OPERATION)
-
     if not isinstance(values, list) or not values:
         raise ExecutionError("payload must contain a non-empty list field 'values'")
 
-    for value in values:
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise ExecutionError("REDUCE values must contain only numeric values")
+    if payload.get("execution_mode") == "serialized_callable":
+        fn = _deserialize_callable_field(payload)
+        result = _call_with_values(fn, values)
+        _check_result_is_json_safe(result, "REDUCE(serialized_callable)")
+        return result
 
-    return REDUCE_OPERATIONS[operation](values)
+    operation = payload.get("operation")
+
+    if operation in REDUCE_OPERATIONS:
+        for value in values:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ExecutionError("REDUCE values must contain only numeric values")
+        return REDUCE_OPERATIONS[operation](values)
+
+    fn = registry.get_function(operation)
+    if fn is None:
+        raise ExecutionError(f"Unsupported REDUCE operation: {operation}", code=ExecutionErrorCode.UNKNOWN_OPERATION)
+
+    result = _call_with_values(fn, values)
+    _check_result_is_json_safe(result, operation)
+    return result
+
+
+def _call_with_values(fn, values: list):
+    try:
+        return fn(values)
+    except Exception as exc:
+        raise ExecutionError(f"{type(exc).__name__}: {exc}", code=ExecutionErrorCode.USER_FUNCTION_ERROR) from exc
 
 
 def execute_registered(operation: str, payload: dict):
@@ -246,21 +323,15 @@ def _execute_serialized_callable(payload: dict):
     categories; this path additionally has DESERIALIZATION_FAILED, for a
     'callable' field that isn't valid base64 or doesn't decode back into a
     callable object (see worker/serialization.py)."""
-    encoded = payload.get("callable")
     args = payload.get("args", [])
     kwargs = payload.get("kwargs", {})
 
-    if not isinstance(encoded, str) or not encoded:
-        raise ExecutionError("payload must contain a non-empty string field 'callable'")
     if not isinstance(args, list):
         raise ExecutionError("payload field 'args' must be a list")
     if not isinstance(kwargs, dict):
         raise ExecutionError("payload field 'kwargs' must be an object")
 
-    try:
-        fn = serialization.deserialize_callable(serialization.decode_from_wire(encoded))
-    except serialization.SerializationError as exc:
-        raise ExecutionError(str(exc), code=ExecutionErrorCode.DESERIALIZATION_FAILED) from exc
+    fn = _deserialize_callable_field(payload)
 
     try:
         result = fn(*args, **kwargs)
