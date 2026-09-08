@@ -323,6 +323,30 @@ Worker 2 → No heartbeat
 
 This prevents a single worker failure from causing the entire job to fail.
 
+### Retry Semantics
+
+Retry is a **policy decision**, not an automatic property of every
+failure -- the two kinds of failure a task can have are handled
+differently, deliberately:
+
+| Failure kind | Example | Retried? |
+|---|---|---|
+| Worker/transport failure | connection dies, heartbeat times out | Yes -- requeued and reassigned to another worker (up to `MAX_TASK_ATTEMPTS`) |
+| Execution failure | the function itself raises, bad arguments, non-serializable result | No -- the task is marked `FAILED` at its current attempt |
+
+The reasoning: a worker/transport failure is usually transient (a crash,
+a network blip) and unrelated to the task itself, so retrying on a
+different worker is likely to succeed. An execution failure is
+deterministic -- the same function called with the same arguments on any
+worker fails the same way (see `worker/executor.py`'s `ExecutionErrorCode`
+categories) -- so retrying it would just reproduce the identical failure
+and waste a worker slot. This distinction currently only has two buckets;
+a future retry policy could reasonably subdivide "execution failure"
+further (e.g. a transient error inside a registered function, which
+*would* benefit from a retry, versus a deterministic bug, which wouldn't)
+-- not implemented today, and worth tracking before relying on retries
+for anything beyond worker/transport failures.
+
 ## Learning Objectives
 
 This project is intended to develop practical knowledge of:

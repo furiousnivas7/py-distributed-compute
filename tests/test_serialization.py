@@ -85,3 +85,22 @@ def test_decode_from_wire_rejects_invalid_base64():
 def test_decode_from_wire_rejects_empty_string():
     with pytest.raises(serialization.SerializationError):
         serialization.decode_from_wire("")
+
+
+def test_serialize_callable_rejects_a_closure_over_an_oversized_object(monkeypatch):
+    """Doesn't actually build a 10MB closure -- lowers the limit instead,
+    so the test stays fast while still exercising the real guard."""
+    monkeypatch.setattr(serialization, "MAX_SERIALIZED_CALLABLE_BYTES", 10)
+
+    def fn():
+        return "this closure's pickled form is well over 10 bytes"
+
+    with pytest.raises(serialization.SerializationError, match="exceeding"):
+        serialization.serialize_callable(fn)
+
+
+def test_serialize_callable_under_the_limit_succeeds(monkeypatch):
+    monkeypatch.setattr(serialization, "MAX_SERIALIZED_CALLABLE_BYTES", 10_000)
+    data = serialization.serialize_callable(lambda x: x + 1)
+    fn = serialization.deserialize_callable(data)
+    assert fn(1) == 2

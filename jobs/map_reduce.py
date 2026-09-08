@@ -19,9 +19,10 @@ unscoped dispatch can dispatch and "keep" a response that actually
 belongs to someone else's task, corrupting both callers' results.
 """
 
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Union
 
 from jobs.map import build_intermediate_results, build_map_job
+from jobs.models import ExecutionSpec
 from jobs.reduce import build_reduce_job, collect_reduce_results
 from jobs.shuffle import shuffle
 from master.scheduler import Scheduler
@@ -34,8 +35,8 @@ async def run_map_reduce(
     dispatch: DispatchFn,
     job_id: str,
     data: list,
-    map_operation: str,
-    reduce_operation: str,
+    map_operation: Union[str, ExecutionSpec],
+    reduce_operation: Union[str, ExecutionSpec],
     num_partitions: int,
 ) -> dict:
     """Run a full Map -> Shuffle -> Reduce job and return the final result.
@@ -52,6 +53,16 @@ async def run_map_reduce(
     queue -- so this job's dispatch can safely run concurrently with any
     other caller's (another job, ordinary ad-hoc tasks, or the failure
     monitor) without either one's responses ending up in the wrong place.
+
+    `map_operation`/`reduce_operation` each independently accept a plain
+    string (a built-in operation name, or the name of a function
+    registered via worker.registry -- unchanged since before Phase 10.5)
+    or an ExecutionSpec.serialized(fn) for an arbitrary callable (Phase
+    10.5) -- build_map_job/build_reduce_job do the actual dispatch-shape
+    work via ExecutionSpec.coerce, so this function needed no signature
+    or behavior change to support either: all four combinations
+    (registered+registered, serialized+serialized, registered+serialized,
+    serialized+registered) go through this exact same code path.
     """
     map_tasks = build_map_job(scheduler, job_id, map_operation, data, num_partitions)
     map_task_ids = {task.task_id for task in map_tasks}

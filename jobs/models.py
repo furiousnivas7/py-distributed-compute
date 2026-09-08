@@ -7,11 +7,48 @@ model.
 """
 
 from dataclasses import dataclass
+from typing import Callable, Union
 
 
 class ResultStatus:
     SUCCESS = "success"
     ERROR = "error"
+
+
+@dataclass(frozen=True)
+class ExecutionSpec:
+    """Phase 10.5: describes how to run a MAP or REDUCE operation, so the
+    SAME orchestration API (jobs.map.build_map_job, jobs.reduce.
+    build_reduce_job, jobs.map_reduce.run_map_reduce) works for a
+    registered/built-in operation name and an arbitrary serialized
+    callable -- no separate "_serialized" pipeline needed.
+
+    Construct via .registered()/.serialized(), not the constructor
+    directly -- ExecutionSpec.coerce() (what build_map_job/build_reduce_job
+    call internally) also accepts a plain string as shorthand for
+    .registered(that string), which is what makes every existing caller
+    passing "WORD_COUNT" or "SUM" keep working completely unchanged.
+    """
+
+    execution_mode: str
+    operation: str | None = None
+    fn: Callable | None = None
+
+    @classmethod
+    def registered(cls, operation: str) -> "ExecutionSpec":
+        return cls("registered", operation=operation)
+
+    @classmethod
+    def serialized(cls, fn: Callable) -> "ExecutionSpec":
+        return cls("serialized_callable", fn=fn)
+
+    @classmethod
+    def coerce(cls, value: Union[str, "ExecutionSpec"]) -> "ExecutionSpec":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls.registered(value)
+        raise TypeError(f"Expected a str or ExecutionSpec, got {type(value).__name__}")
 
 
 @dataclass

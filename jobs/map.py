@@ -8,8 +8,10 @@ dispatch, retry, attempt protection, and failure recovery for free -- no
 second scheduler, no MapReduce-specific dispatch logic.
 """
 
+from typing import Union
+
 from common.models import Task
-from jobs.models import IntermediateResult, ResultStatus
+from jobs.models import ExecutionSpec, IntermediateResult, ResultStatus
 from master.scheduler import Scheduler
 from worker import serialization
 
@@ -40,56 +42,42 @@ def partition(data: list, num_partitions: int) -> list[list]:
 def build_map_job(
     scheduler: Scheduler,
     job_id: str,
-    operation: str,
+    operation: Union[str, ExecutionSpec],
     data: list,
     num_partitions: int,
 ) -> list[Task]:
     """Partition `data` and submit one MAP task per partition.
 
-    `operation` may be a built-in (SQUARE, DOUBLE, WORD_COUNT, ...) or --
-    Phase 10.5 -- the name of a function registered via worker.registry;
-    worker.executor.execute_map falls back to the registry for whatever
-    isn't a built-in, so this same call works for either unchanged. Use
-    build_map_job_serialized() instead for an arbitrary (unregistered)
-    callable.
+    `operation` is either a plain string -- a built-in (SQUARE, DOUBLE,
+    WORD_COUNT, ...) or the name of a function registered via
+    worker.registry; worker.executor.execute_map falls back to the
+    registry for whatever isn't a built-in -- or (Phase 10.5) an
+    ExecutionSpec.serialized(fn) for an arbitrary callable that was never
+    registered anywhere. One orchestration API for all three cases: a
+    plain string is shorthand for ExecutionSpec.registered(that string)
+    (see ExecutionSpec.coerce), so every existing caller passing a bare
+    operation name keeps working completely unchanged.
 
     Returns the submitted tasks in partition order (index 0 is the first
     chunk) -- this order is what collect_map_results needs to reassemble
     the output correctly, since tasks can complete in any order.
     """
+    spec = ExecutionSpec.coerce(operation)
+    encoded = (
+        serialization.encode_for_wire(serialization.serialize_callable(spec.fn))
+        if spec.execution_mode == "serialized_callable"
+        else None
+    )
+
     chunks = partition(data, num_partitions)
 
     tasks = []
     for index, chunk in enumerate(chunks):
         task_id = f"{job_id}-map-{index}"
-        task = scheduler.submit_task(task_id, "MAP", {"operation": operation, "data": chunk})
-        tasks.append(task)
-
-    return tasks
-
-
-def build_map_job_serialized(
-    scheduler: Scheduler,
-    job_id: str,
-    fn,
-    data: list,
-    num_partitions: int,
-) -> list[Task]:
-    """Phase 10.5: build_map_job's counterpart for an arbitrary callable
-    `fn`, serialized once here (see worker.serialization) and shipped
-    identically to every partition's MAP task -- applied to each element
-    of that partition (fn(element)), same per-element calling convention
-    a registered MAP function already uses. See worker/serialization.py's
-    module docstring for the trust-boundary implications of submitting a
-    serialized callable at all.
-    """
-    encoded = serialization.encode_for_wire(serialization.serialize_callable(fn))
-    chunks = partition(data, num_partitions)
-
-    tasks = []
-    for index, chunk in enumerate(chunks):
-        task_id = f"{job_id}-map-{index}"
-        payload = {"execution_mode": "serialized_callable", "callable": encoded, "data": chunk}
+        if encoded is not None:
+            payload = {"execution_mode": "serialized_callable", "callable": encoded, "data": chunk}
+        else:
+            payload = {"operation": spec.operation, "data": chunk}
         task = scheduler.submit_task(task_id, "MAP", payload)
         tasks.append(task)
 

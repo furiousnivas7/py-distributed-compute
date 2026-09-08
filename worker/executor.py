@@ -353,6 +353,17 @@ def _require_numbers(payload: dict):
     return a, b
 
 
+# Namespace rule (Phase 10.5 review): these five names are permanently
+# reserved and can NEVER be shadowed by a registered function -- HANDLERS
+# is always consulted before worker.registry (see execute_task below), not
+# just as an implementation detail but as a deliberate safety property.
+# Without it, `registry.register_function("ADD", ...)` could silently
+# redefine core task semantics for every OTHER caller in the process,
+# including built-in MapReduce operations that assume ADD means addition.
+# Choose registered-function names that don't collide with this list (or
+# with each other -- registration only guards against re-registering the
+# SAME name twice, not against colliding with a different registered name
+# some other module chose).
 HANDLERS = {
     ADD: execute_add,
     MULTIPLY: execute_multiply,
@@ -369,6 +380,16 @@ def execute_task(task_type: str, payload: dict) -> dict:
     user-registered function (Phase 10.2), so both resolve through this
     one entry point rather than needing a caller to know which kind of
     operation they're submitting.
+
+    Registered-vs-serialized execution (inside execute_envelope/execute_map/
+    execute_reduce) is likewise never inferred -- an unrecognized
+    `operation` name is UNKNOWN_OPERATION, full stop, never silently
+    reinterpreted as "maybe they meant to send a serialized callable."
+    Serialized-callable execution is selected ONLY by an explicit
+    `execution_mode: "serialized_callable"` field being present, so a typo
+    in a registered operation name fails loudly as an unknown operation,
+    not by accidentally falling through to a completely different
+    execution path.
 
     An error result always carries a "code" (Phase 10.4, ExecutionErrorCode)
     alongside "message" -- a structured task failure, not a generic

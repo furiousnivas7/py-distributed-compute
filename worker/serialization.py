@@ -37,6 +37,18 @@ import base64
 
 import cloudpickle
 
+# A cloudpickled closure can silently balloon in size -- it captures
+# whatever objects the function references from its enclosing scope, which
+# can include far more than the author intended (a large module-level
+# constant, an accidentally-captured collection). This is a coarse,
+# deliberately generous guard against submitting something pathological by
+# mistake, not a real resource-management policy: tracked as a known
+# limitation (see README's Security Considerations) rather than something
+# this module tries to solve properly -- a real policy would need to
+# account for compression, chunked transfer, and where the limit should
+# actually live (submission time vs. wire size vs. worker memory).
+MAX_SERIALIZED_CALLABLE_BYTES = 10 * 1024 * 1024  # 10 MiB
+
 
 class SerializationError(Exception):
     """Raised when a callable can't be serialized, deserialized, or
@@ -45,14 +57,24 @@ class SerializationError(Exception):
 
 def serialize_callable(fn) -> bytes:
     """Serialize a callable to bytes. Raises SerializationError for a
-    non-callable input or anything cloudpickle itself can't handle (e.g.
-    a closure over an unpicklable object like an open socket)."""
+    non-callable input, anything cloudpickle itself can't handle (e.g. a
+    closure over an unpicklable object like an open socket), or a result
+    exceeding MAX_SERIALIZED_CALLABLE_BYTES (checked here, at submission
+    time, so an oversized closure fails fast instead of only being
+    discovered after already being sent over the wire)."""
     if not callable(fn):
         raise SerializationError("fn must be callable")
     try:
-        return cloudpickle.dumps(fn)
+        data = cloudpickle.dumps(fn)
     except Exception as exc:
         raise SerializationError(f"Failed to serialize callable: {exc}") from exc
+    if len(data) > MAX_SERIALIZED_CALLABLE_BYTES:
+        raise SerializationError(
+            f"Serialized callable is {len(data)} bytes, exceeding the "
+            f"{MAX_SERIALIZED_CALLABLE_BYTES}-byte limit -- likely capturing "
+            "more from its enclosing scope than intended"
+        )
+    return data
 
 
 def deserialize_callable(data: bytes):

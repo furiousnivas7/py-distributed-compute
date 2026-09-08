@@ -22,7 +22,10 @@ missing key. A silently-dropped key here would corrupt the final result
 with no indication anything was wrong, so Reduce failure must be explicit.
 """
 
+from typing import Union
+
 from common.models import Task
+from jobs.models import ExecutionSpec
 from master.scheduler import Scheduler
 from worker import serialization
 from worker.executor import REDUCE_OPERATIONS, ExecutionError, execute_reduce
@@ -50,42 +53,41 @@ def reduce_grouped(grouped: dict, operation: str) -> dict:
     return reduced
 
 
-def build_reduce_job(scheduler: Scheduler, job_id: str, grouped: dict, operation: str) -> dict[str, Task]:
+def build_reduce_job(
+    scheduler: Scheduler, job_id: str, grouped: dict, operation: Union[str, ExecutionSpec]
+) -> dict[str, Task]:
     """Submit one REDUCE task per key in `grouped`.
 
-    `operation` may be a built-in (SUM, COUNT, MAX, MIN) or -- Phase
-    10.5 -- the name of a function registered via worker.registry, called
+    `operation` is either a plain string -- a built-in (SUM, COUNT, MAX,
+    MIN) or the name of a function registered via worker.registry, called
     as fn(values) with the whole per-key value list (matching the
     built-ins' own aggregate calling convention); worker.executor.
     execute_reduce falls back to the registry for whatever isn't a
-    built-in, so this same call works for either unchanged. Use
-    build_reduce_job_serialized() instead for an arbitrary (unregistered)
-    callable.
+    built-in -- or (Phase 10.5) an ExecutionSpec.serialized(fn) for an
+    arbitrary callable that was never registered anywhere. One
+    orchestration API for all three cases: a plain string is shorthand
+    for ExecutionSpec.registered(that string) (see ExecutionSpec.coerce),
+    so every existing caller passing a bare operation name keeps working
+    completely unchanged.
 
     Returns a dict mapping each key to its submitted Task -- keyed by key
     rather than an ordered list, since Reduce has no partition-order
     equivalent (each key's reduction is independent of every other key's).
     """
+    spec = ExecutionSpec.coerce(operation)
+    encoded = (
+        serialization.encode_for_wire(serialization.serialize_callable(spec.fn))
+        if spec.execution_mode == "serialized_callable"
+        else None
+    )
+
     tasks = {}
     for key, values in grouped.items():
         task_id = f"{job_id}-reduce-{key}"
-        task = scheduler.submit_task(task_id, "REDUCE", {"operation": operation, "key": key, "values": values})
-        tasks[key] = task
-
-    return tasks
-
-
-def build_reduce_job_serialized(scheduler: Scheduler, job_id: str, grouped: dict, fn) -> dict[str, Task]:
-    """Phase 10.5: build_reduce_job's counterpart for an arbitrary callable
-    `fn`, serialized once here (see worker.serialization) and shipped
-    identically to every key's REDUCE task -- called as fn(values), the
-    whole per-key list in one call, same as a registered REDUCE function.
-    """
-    encoded = serialization.encode_for_wire(serialization.serialize_callable(fn))
-    tasks = {}
-    for key, values in grouped.items():
-        task_id = f"{job_id}-reduce-{key}"
-        payload = {"execution_mode": "serialized_callable", "callable": encoded, "key": key, "values": values}
+        if encoded is not None:
+            payload = {"execution_mode": "serialized_callable", "callable": encoded, "key": key, "values": values}
+        else:
+            payload = {"operation": spec.operation, "key": key, "values": values}
         task = scheduler.submit_task(task_id, "REDUCE", payload)
         tasks[key] = task
 

@@ -141,6 +141,16 @@ class Scheduler:
         return task
 
     def fail_task(self, task_id: str) -> Task:
+        """Mark a task FAILED at its current attempt -- deliberately NOT
+        requeued. Retry is a policy choice, not automatic for every
+        failure (see README's "Retry Semantics"): this is called for an
+        EXECUTION failure (a worker replied, but the task itself failed --
+        wrong arguments, the function's own exception, a non-serializable
+        result), which is treated as deterministic and not worth retrying
+        on another worker, unlike a worker/transport failure
+        (requeue_tasks_for_worker, called separately from a connection
+        death or heartbeat timeout, which DOES requeue for reassignment).
+        """
         task = self._get_existing_task(task_id)
 
         task.status = TaskStatus.FAILED
