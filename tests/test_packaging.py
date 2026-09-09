@@ -220,6 +220,17 @@ def test_dev_dependencies_not_runtime(clean_installed_venv):
     assert result.returncode != 0, "pytest must not be installed by the plain wheel"
 
 
+def test_console_script_installed_and_runs(clean_installed_venv):
+    """Phase 12.3: `pydc` (pyproject.toml's [project.scripts]) must be a
+    real, runnable command after a plain wheel install -- not just
+    importable as `python -c "import client"`."""
+    pydc = clean_installed_venv.parent / "pydc"
+    assert pydc.exists(), f"pydc console script not found next to {clean_installed_venv}"
+    result = _run([str(pydc), "--version"])
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert result.stdout.strip()
+
+
 def test_dev_extra_installs_pytest(tmp_path):
     """The other half of the same contract: `pip install .[dev]` (the
     documented dev-setup path) DOES pull in pytest."""

@@ -26,6 +26,12 @@ dependencies = ["cloudpickle>=3.0"]
 # drives its own asyncio.run() inside a plain `def test_...()`.
 dev = ["pytest>=7.0"]
 
+# Phase 12.3: `pydc` is client.py's main() -- see that module's own
+# docstring for the three subcommands (master/worker/run) and why
+# job submission has no separate remote-client command.
+[project.scripts]
+pydc = "client:main"
+
 [tool.setuptools]
 # Explicit list, not automatic discovery -- this repo has no src/ layout
 # and several unrelated top-level directories with their own __init__.py
@@ -37,3 +43,7 @@ dev = ["pytest>=7.0"]
 # migration (e.g. everything under a single `py_distributed_compute`
 # package) is a breaking change to leave for a separate phase.
 packages = ["common", "jobs", "master", "rpc", "worker"]
+# client.py is a standalone top-level module (pydc's entry point, see
+# [project.scripts] above), not a package -- must be listed separately
+# from `packages` or setuptools won't include it in the distribution.
+py-modules = ["client"]

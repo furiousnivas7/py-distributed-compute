@@ -321,41 +321,61 @@ worker_task = asyncio.create_task(run_worker(host, port, backend=backend))
 
 ## Usage
 
-Start the master:
+`pydc` (installed with the project -- see Installation above; run
+`pydc --help` for the full command list) is the command-line entry point.
+
+Start the master, and keep it running (Ctrl+C to stop):
 
 ```bash
-python -m master.server
+pydc master
 ```
 
-Start a worker:
+Start a worker in another terminal, pointed at that master:
 
 ```bash
-python -m worker.worker
+pydc worker
 ```
 
-Start additional workers in separate terminals:
+Start additional workers in more terminals the same way -- each gets a
+randomly generated `--worker-id` unless you set one explicitly:
 
 ```bash
-python -m worker.worker
+pydc worker --worker-id worker-2
 ```
 
-Submit a job:
+Run one job without a separate master/worker process at all -- starts an
+in-process master + one local worker, submits the job, prints the JSON
+result, and exits:
 
 ```bash
-python client.py submit wordcount data.txt
+pydc run call ADD --arg a=10 --arg b=32
+# 42
+
+pydc run mapreduce --data words.json --map WORD_COUNT --reduce SUM --partitions 4
 ```
 
-> The exact commands may change during development.
+See "Execution Backend Configuration" below for `--backend`/`--max-workers`/
+etc. (accepted by both `pydc worker` and `pydc run`), and `pydc worker
+--help`/`pydc master --help`/`pydc run --help` for every flag.
+
+> **Why isn't there a `pydc submit` that talks to an already-running
+> remote master?** `master.scheduler` is an in-process singleton, and the
+> wire protocol has no client-facing job-submission message type -- only
+> worker<->master messages. `pydc run` is the closest equivalent that
+> needs no protocol change: everything happens in one process. Submitting
+> to a separate, already-running master from a different process is a
+> real gap, left for a future phase that explicitly adds a client-facing
+> RPC endpoint.
 
 ## Execution Backend Configuration
 
-A worker started via `worker.async_worker` (`python -m worker.async_worker`)
+A worker started via `worker.async_worker` (`pydc worker`)
 selects and configures its `ExecutionBackend` (see `worker/backend.py`) at
 startup, without any application code changes -- see `worker/config.py`.
 View all available options:
 
 ```bash
-python -m worker.async_worker --help
+pydc worker --help
 ```
 
 ### Options
@@ -366,6 +386,23 @@ python -m worker.async_worker --help
 | `--max-workers` | `PY_DISTRIBUTED_MAX_WORKERS` | pool default (`os.cpu_count()`) | process pool size (`multiprocessing` only) |
 | `--max-in-flight` | `PY_DISTRIBUTED_MAX_IN_FLIGHT` | unbounded | cap on concurrently in-flight executions (`multiprocessing` only) |
 | `--mp-context` | `PY_DISTRIBUTED_MP_CONTEXT` | `fork` | `fork`, `spawn`, or `forkserver` (`multiprocessing` only) |
+
+`pydc worker` also accepts, same CLI/env/defaults precedence, resolved
+independently of the backend options above:
+
+| CLI flag | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `--master-host` | `PY_DISTRIBUTED_MASTER_HOST` | `127.0.0.1` | host to connect to |
+| `--master-port` | `PY_DISTRIBUTED_MASTER_PORT` | `5000` | port to connect to |
+| `--worker-id` | `PY_DISTRIBUTED_WORKER_ID` | a random id | reported to the master on REGISTER |
+| `--worker-host` | `PY_DISTRIBUTED_WORKER_HOST` | `127.0.0.1` | reported to the master as metadata only |
+| `--worker-port` | `PY_DISTRIBUTED_WORKER_PORT` | `6001` | reported to the master as metadata only |
+
+`pydc master` accepts `--host`/`--port` (same `PY_DISTRIBUTED_MASTER_HOST`/
+`PY_DISTRIBUTED_MASTER_PORT` environment variables -- a worker uses them to
+know where to *connect*; a master started via its own CLI uses the same
+two variables to know where to *bind*, so one pair of env vars covers a
+typical deployment either way).
 
 ### Precedence
 
@@ -381,13 +418,13 @@ Direct backend (the default -- runs tasks in-process, identical to every
 worker before Phase 11):
 
 ```bash
-python -m worker.async_worker
+pydc worker
 ```
 
 Multiprocessing backend via CLI flags:
 
 ```bash
-python -m worker.async_worker --backend multiprocessing --max-workers 4 --max-in-flight 8
+pydc worker --backend multiprocessing --max-workers 4 --max-in-flight 8
 ```
 
 Multiprocessing backend via environment variables:
@@ -397,7 +434,7 @@ export PY_DISTRIBUTED_BACKEND=multiprocessing
 export PY_DISTRIBUTED_MAX_WORKERS=4
 export PY_DISTRIBUTED_MAX_IN_FLIGHT=8
 export PY_DISTRIBUTED_MP_CONTEXT=spawn
-python -m worker.async_worker
+pydc worker
 ```
 
 Invalid configuration is rejected immediately with an actionable message,
@@ -408,7 +445,7 @@ never a generic error or a silent fallback to a working value.
 The resolved configuration is visible at startup: a `Selected backend: ...`
 line is printed, and `backend_config_resolved`/`worker_starting` are logged
 at INFO (see `worker/backend.py` and `worker/config.py`'s module loggers --
-`python -m worker.async_worker` configures logging to stdout by default).
+`pydc worker` configures logging to stdout by default).
 
 See `worker/backend.py`'s `MultiprocessingBackend` docstring for what
 `mp_context` actually changes (fork vs. spawn/forkserver registered-function
