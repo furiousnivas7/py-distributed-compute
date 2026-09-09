@@ -46,10 +46,21 @@ def _create_venv(path: Path) -> Path:
 def built_wheel(tmp_path_factory):
     """Build the wheel ONCE for the whole test session -- python -m build
     into an isolated temp dist dir (never REPO_ROOT/dist, so this never
-    interferes with a real release build the user might run separately)."""
+    interferes with a real release build the user might run separately).
+
+    --no-isolation: by default `python -m build` creates a SEPARATE,
+    throwaway virtualenv and pip-installs build-system.requires (here:
+    setuptools>=61) into it for every single invocation -- expensive and
+    (worse) network-dependent. sys.executable (this repo's own .venv)
+    already has a new enough setuptools installed (see the dev-setup
+    note in README's Installation section), so --no-isolation reuses it
+    directly instead, cutting real build time and one whole source of
+    environment churn a repeated build/test loop would otherwise pay for
+    every iteration.
+    """
     dist_dir = tmp_path_factory.mktemp("dist")
     result = _run(
-        [sys.executable, "-m", "build", "--outdir", str(dist_dir)],
+        [sys.executable, "-m", "build", "--no-isolation", "--outdir", str(dist_dir)],
         cwd=str(REPO_ROOT),
         timeout=180,
     )

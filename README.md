@@ -226,6 +226,16 @@ Install the project in editable mode, plus development dependencies
 pip install -e .[dev]
 ```
 
+If you'll also be running `python -m build` locally (e.g. to run
+`tests/test_packaging.py`), install a new enough `setuptools` in this same
+venv too -- the test suite builds with `--no-isolation` for speed, which
+means it uses whatever `setuptools` this venv already has instead of
+fetching a fresh one into a throwaway build environment every time:
+
+```bash
+pip install --upgrade "setuptools>=61.0" wheel build
+```
+
 (`pip install -r requirements.txt` does exactly the same thing -- kept as
 the familiar entry point.) For a runtime-only install with no dev
 dependencies, drop the extra: `pip install -e .` -- or `pip install .`
