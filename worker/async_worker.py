@@ -13,6 +13,7 @@ coroutines can never interleave mid-message the way two OS threads could.
 
 import asyncio
 import logging
+import sys
 
 from rpc import protocol
 from rpc.async_connection import AsyncConnection
@@ -259,14 +260,42 @@ async def run_worker(
 
 
 def main() -> None:
+    # Phase 11.8: only main() (the actual CLI entry point) configures
+    # logging output -- a library caller (run_worker(), tests, anything
+    # importing this module) must never have logging configuration
+    # imposed on it just by importing worker.async_worker. Without this,
+    # every INFO-level structured log added in Phase 11.6/11.7
+    # (backend_created, backend_config_resolved, worker_starting, ...)
+    # is silently dropped by logging's default WARNING threshold when run
+    # as a plain script.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+
     # Phase 11.7: backend selection/configuration is a CLI-and-environment
     # concern, resolved here (the process entry point) -- run_worker()
     # itself still just takes an already-built `backend` argument
     # unchanged since Phase 11.1, so nothing about its own signature or
     # any of its callers (including every test that builds a backend
     # directly) needs to change.
-    config = resolve_backend_config()
-    backend = build_backend(config)
+    # Phase 11.8: a bad --backend/--max-workers/... value is a normal,
+    # anticipated user mistake, not a bug -- reported as a clean one-line
+    # message on stderr with exit code 1, not a raw traceback pointing
+    # into resolve_backend_config's internals. resolve_backend_config's
+    # ValueError message itself already says what was actually received
+    # (Phase 11.6/11.7); this only changes how it's PRESENTED at the CLI
+    # boundary, not its wording.
+    try:
+        config = resolve_backend_config()
+        backend = build_backend(config)
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    # Phase 11.8: a plain print() here too, not just the structured log --
+    # resolve_backend_config/backend.describe() already log this at INFO,
+    # but this line guarantees an operator sees which backend got
+    # selected even if they've redirected/filtered logging output,
+    # matching this file's existing print()-for-human-visible-status-lines
+    # convention (see the PING/REGISTER status prints in run_worker below).
+    print(f"Selected backend: {backend.describe()}")
     asyncio.run(run_worker(MASTER_HOST, MASTER_PORT, backend=backend))
 
 

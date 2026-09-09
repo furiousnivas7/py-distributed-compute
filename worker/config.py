@@ -57,11 +57,55 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # strings and validated uniformly, once, in resolve_backend_config /
     # build_backend, regardless of which source (CLI, env, default) they
     # came from.
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--backend", default=None)
-    parser.add_argument("--max-workers", default=None)
-    parser.add_argument("--max-in-flight", default=None)
-    parser.add_argument("--mp-context", default=None)
+    #
+    # add_help=True (Phase 11.8): worker.config's parser is the only CLI
+    # argument surface a worker process has (see worker/async_worker.py's
+    # main()), so there's nothing else here for --help to conflict with --
+    # `python -m worker.async_worker --help` now prints usage for these
+    # four flags and exits, instead of --help silently falling through
+    # parse_known_args as an unrecognized argument.
+    parser = argparse.ArgumentParser(
+        prog="worker.async_worker",
+        description=(
+            "Run a worker process. Backend selection precedence: "
+            "CLI arguments > environment variables > defaults."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        default=None,
+        help=(
+            f"Execution backend to use, one of {VALID_BACKENDS!r}. "
+            f"Falls back to the {ENV_BACKEND} environment variable, then 'direct'."
+        ),
+    )
+    parser.add_argument(
+        "--max-workers",
+        default=None,
+        help=(
+            "Process pool size for the multiprocessing backend (positive integer). "
+            f"Falls back to {ENV_MAX_WORKERS}, then the pool's own default "
+            "(os.cpu_count()). Ignored by the direct backend."
+        ),
+    )
+    parser.add_argument(
+        "--max-in-flight",
+        default=None,
+        help=(
+            "Cap on concurrently in-flight executions for the multiprocessing "
+            f"backend (positive integer). Falls back to {ENV_MAX_IN_FLIGHT}, then "
+            "unbounded. Ignored by the direct backend."
+        ),
+    )
+    parser.add_argument(
+        "--mp-context",
+        default=None,
+        help=(
+            "multiprocessing start method for the multiprocessing backend, one of "
+            f"('fork', 'spawn', 'forkserver'). Falls back to {ENV_MP_CONTEXT}, "
+            "then 'fork'. Ignored by the direct backend."
+        ),
+    )
     return parser
 
 

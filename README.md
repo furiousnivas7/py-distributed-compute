@@ -245,6 +245,74 @@ python client.py submit wordcount data.txt
 
 > The exact commands may change during development.
 
+## Execution Backend Configuration
+
+A worker started via `worker.async_worker` (`python -m worker.async_worker`)
+selects and configures its `ExecutionBackend` (see `worker/backend.py`) at
+startup, without any application code changes -- see `worker/config.py`.
+View all available options:
+
+```bash
+python -m worker.async_worker --help
+```
+
+### Options
+
+| CLI flag | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `--backend` | `PY_DISTRIBUTED_BACKEND` | `direct` | `direct` or `multiprocessing` |
+| `--max-workers` | `PY_DISTRIBUTED_MAX_WORKERS` | pool default (`os.cpu_count()`) | process pool size (`multiprocessing` only) |
+| `--max-in-flight` | `PY_DISTRIBUTED_MAX_IN_FLIGHT` | unbounded | cap on concurrently in-flight executions (`multiprocessing` only) |
+| `--mp-context` | `PY_DISTRIBUTED_MP_CONTEXT` | `fork` | `fork`, `spawn`, or `forkserver` (`multiprocessing` only) |
+
+### Precedence
+
+**CLI arguments > environment variables > defaults.** A field omitted from
+the CLI falls back to its environment variable; a field set in neither
+falls back to its default -- resolved independently per field, so e.g.
+`--max-workers` on the CLI and `PY_DISTRIBUTED_MAX_IN_FLIGHT` in the
+environment can both apply to the same worker at once.
+
+### Examples
+
+Direct backend (the default -- runs tasks in-process, identical to every
+worker before Phase 11):
+
+```bash
+python -m worker.async_worker
+```
+
+Multiprocessing backend via CLI flags:
+
+```bash
+python -m worker.async_worker --backend multiprocessing --max-workers 4 --max-in-flight 8
+```
+
+Multiprocessing backend via environment variables:
+
+```bash
+export PY_DISTRIBUTED_BACKEND=multiprocessing
+export PY_DISTRIBUTED_MAX_WORKERS=4
+export PY_DISTRIBUTED_MAX_IN_FLIGHT=8
+export PY_DISTRIBUTED_MP_CONTEXT=spawn
+python -m worker.async_worker
+```
+
+Invalid configuration is rejected immediately with an actionable message,
+e.g. `max_workers must be a positive integer or None; received -2` or
+`backend must be one of ('direct', 'multiprocessing'); received 'gpu'` --
+never a generic error or a silent fallback to a working value.
+
+The resolved configuration is visible at startup: a `Selected backend: ...`
+line is printed, and `backend_config_resolved`/`worker_starting` are logged
+at INFO (see `worker/backend.py` and `worker/config.py`'s module loggers --
+`python -m worker.async_worker` configures logging to stdout by default).
+
+See `worker/backend.py`'s `MultiprocessingBackend` docstring for what
+`mp_context` actually changes (fork vs. spawn/forkserver registered-function
+visibility) and `README.md`'s Security Considerations section for what a
+worker trusts regardless of backend.
+
 ## Example Jobs
 
 The engine will initially support:

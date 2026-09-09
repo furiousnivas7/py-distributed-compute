@@ -8,6 +8,9 @@ validation rather than silently swallowing a bad value.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -218,3 +221,111 @@ def test_full_config_to_backend_to_worker_pipeline_preserves_execution_behavior(
 
     response = asyncio.run(scenario())
     assert response["payload"]["result"] == 36
+
+
+# -- Phase 11.8: subprocess-level CLI/env resolution and CLI polish ------
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_PRINT_RESOLVED_BACKEND = (
+    "from worker.config import build_backend, resolve_backend_config; "
+    "print(build_backend(resolve_backend_config()).describe())"
+)
+
+
+def _run(args, env_extra=None):
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(
+        [sys.executable, "-c", _PRINT_RESOLVED_BACKEND, *args],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_subprocess_cli_resolution_selects_multiprocessing_backend():
+    result = _run(["--backend", "multiprocessing", "--max-workers", "3"])
+    assert result.returncode == 0
+    assert "'backend': 'MultiprocessingBackend'" in result.stdout
+    assert "'max_workers': 3" in result.stdout
+
+
+def test_subprocess_env_resolution_selects_multiprocessing_backend():
+    result = _run(
+        [],
+        env_extra={ENV_BACKEND: "multiprocessing", ENV_MAX_WORKERS: "4", ENV_MAX_IN_FLIGHT: "2"},
+    )
+    assert result.returncode == 0
+    assert "'backend': 'MultiprocessingBackend'" in result.stdout
+    assert "'max_workers': 4" in result.stdout
+    assert "'max_in_flight': 2" in result.stdout
+
+
+def test_subprocess_cli_overrides_env_end_to_end():
+    result = _run(
+        ["--max-workers", "9"],
+        env_extra={ENV_BACKEND: "multiprocessing", ENV_MAX_WORKERS: "1"},
+    )
+    assert result.returncode == 0
+    assert "'max_workers': 9" in result.stdout
+
+
+def test_subprocess_default_with_no_configuration_is_direct_backend():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PY_DISTRIBUTED_")}
+    result = subprocess.run(
+        [sys.executable, "-c", _PRINT_RESOLVED_BACKEND],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0
+    assert "'backend': 'DirectBackend'" in result.stdout
+
+
+def test_worker_cli_help_exits_cleanly_with_usage_text():
+    result = subprocess.run(
+        [sys.executable, "-m", "worker.async_worker", "--help"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0
+    assert "--backend" in result.stdout
+    assert "--max-workers" in result.stdout
+    assert "--max-in-flight" in result.stdout
+    assert "--mp-context" in result.stdout
+
+
+def test_worker_cli_invalid_backend_reports_a_clean_error_not_a_traceback():
+    result = subprocess.run(
+        [sys.executable, "-m", "worker.async_worker", "--backend", "not-a-real-backend"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 1
+    assert "Configuration error:" in result.stderr
+    assert "not-a-real-backend" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_worker_cli_invalid_max_workers_reports_a_clean_error_not_a_traceback():
+    result = subprocess.run(
+        [sys.executable, "-m", "worker.async_worker", "--backend", "multiprocessing", "--max-workers", "0"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 1
+    assert "Configuration error:" in result.stderr
+    assert "received 0" in result.stderr
+    assert "Traceback" not in result.stderr
