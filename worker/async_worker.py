@@ -19,6 +19,7 @@ from rpc.async_connection import AsyncConnection
 from rpc.async_rpc import new_request_id, receive_message, send_message, send_request
 from rpc.protocol import build_message
 from worker.backend import DirectBackend, ExecutionBackend
+from worker.config import build_backend, resolve_backend_config
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +259,15 @@ async def run_worker(
 
 
 def main() -> None:
-    asyncio.run(run_worker(MASTER_HOST, MASTER_PORT))
+    # Phase 11.7: backend selection/configuration is a CLI-and-environment
+    # concern, resolved here (the process entry point) -- run_worker()
+    # itself still just takes an already-built `backend` argument
+    # unchanged since Phase 11.1, so nothing about its own signature or
+    # any of its callers (including every test that builds a backend
+    # directly) needs to change.
+    config = resolve_backend_config()
+    backend = build_backend(config)
+    asyncio.run(run_worker(MASTER_HOST, MASTER_PORT, backend=backend))
 
 
 if __name__ == "__main__":
