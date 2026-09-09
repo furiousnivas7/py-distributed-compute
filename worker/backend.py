@@ -29,10 +29,46 @@ implement it correctly without a breaking interface change later.
 
 import asyncio
 import multiprocessing
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, replace
 
 from worker.executor import execute_task
+
+
+@dataclass
+class BackendMetrics:
+    """Phase 11.5: a point-in-time snapshot of a backend's execution
+    activity -- purely observational, never read by anything that affects
+    scheduling, retries, or the wire protocol. `submitted` counts every
+    execute() call accepted; `completed`/`failed` split on the SAME
+    success/error distinction execute_task's own result dict already
+    makes (never on exceptions); `backend_errors` counts the OTHER
+    category, an execute() call that raised (see ExecutionBackend.execute's
+    docstring for that split). `total_execution_time`/`total_wait_time`
+    are running sums, not the count-derived average -- divide by
+    completed+failed (or submitted) yourself if you want a mean.
+
+    Concurrency safety: every counter here is mutated only from coroutine
+    code running on the worker's own asyncio event loop -- never from a
+    worker thread, and never from the child PROCESS a task actually runs
+    in (that process only ever returns a plain result/exception back
+    through run_in_executor's own future, which resolves back on the
+    event loop). A single OS thread runs Python bytecode at a time under
+    asyncio, and no `await` sits between a counter's read and its write
+    anywhere in this file, so plain `+=`/`-=` needs no lock. This would
+    change if a future backend updated these counters from a real OS
+    thread (e.g. a ThreadPoolExecutor-based backend) instead.
+    """
+
+    submitted: int = 0
+    running: int = 0
+    completed: int = 0
+    failed: int = 0
+    backend_errors: int = 0
+    total_execution_time: float = 0.0
+    total_wait_time: float = 0.0
 
 
 class ExecutionBackend(ABC):
@@ -94,6 +130,19 @@ class ExecutionBackend(ABC):
     async def stop(self) -> None:
         """Called once when this backend will serve no more tasks."""
 
+    def get_metrics(self) -> BackendMetrics:
+        """Phase 11.5: a snapshot of this backend's execution activity.
+
+        Non-breaking observability contract -- the default here returns an
+        empty/default snapshot, so any existing ExecutionBackend subclass
+        (including ones defined outside this file, e.g. in tests) keeps
+        working unchanged without needing to implement this at all. A
+        backend that wants real numbers overrides it (see DirectBackend,
+        MultiprocessingBackend). Never read by anything in this codebase
+        that affects scheduling, retries, or the wire protocol.
+        """
+        return BackendMetrics()
+
 
 class DirectBackend(ExecutionBackend):
     """The baseline backend (Phase 11.1): runs worker.executor.execute_task
@@ -105,8 +154,34 @@ class DirectBackend(ExecutionBackend):
     ExecutionBackend interface so callers can swap it out.
     """
 
+    def __init__(self):
+        self._metrics = BackendMetrics()
+
     async def execute(self, task_type: str, payload: dict) -> dict:
-        return execute_task(task_type, payload)
+        # execute_task never raises (see ExecutionBackend.execute's
+        # docstring) -- there is no backend-error path here to guard
+        # with try/except; `running` still needs a finally so a caller
+        # that cancels this coroutine before it resumes doesn't leave the
+        # counter stuck (a cancellation can only actually be delivered at
+        # an await point, and there isn't one inside this synchronous
+        # call, but the finally keeps the invariant correct regardless of
+        # how a future change might add one).
+        self._metrics.submitted += 1
+        self._metrics.running += 1
+        start = time.perf_counter()
+        try:
+            result = execute_task(task_type, payload)
+        finally:
+            self._metrics.running -= 1
+        self._metrics.total_execution_time += time.perf_counter() - start
+        if result["status"] == "success":
+            self._metrics.completed += 1
+        else:
+            self._metrics.failed += 1
+        return result
+
+    def get_metrics(self) -> BackendMetrics:
+        return replace(self._metrics)
 
 
 class MultiprocessingBackend(ExecutionBackend):
@@ -212,6 +287,7 @@ class MultiprocessingBackend(ExecutionBackend):
         self._semaphore: asyncio.Semaphore | None = None
         self._pool: ProcessPoolExecutor | None = None
         self.max_concurrency = max_in_flight if max_in_flight is not None else max_workers
+        self._metrics = BackendMetrics()
 
     async def start(self) -> None:
         self._pool = ProcessPoolExecutor(
@@ -220,6 +296,13 @@ class MultiprocessingBackend(ExecutionBackend):
         )
         if self._max_in_flight is not None:
             self._semaphore = asyncio.Semaphore(self._max_in_flight)
+        # Phase 11.5: metrics reset on every start(), matching the
+        # semaphore/pool -- each start()/stop() lifetime gets its own
+        # clean metrics, not numbers carried over from whatever this
+        # backend did in a previous lifetime. Documented contract, not an
+        # accident: call get_metrics() before stop() if you need the
+        # final numbers from a lifetime that's ending.
+        self._metrics = BackendMetrics()
 
     async def stop(self) -> None:
         pool, self._pool = self._pool, None
@@ -249,21 +332,61 @@ class MultiprocessingBackend(ExecutionBackend):
         if self._pool is None:
             raise RuntimeError("MultiprocessingBackend.execute() called before start()")
 
-        if self._semaphore is None:
-            return await self._submit(task_type, payload)
+        self._metrics.submitted += 1
+        try:
+            if self._semaphore is None:
+                return await self._run_and_record(task_type, payload)
 
-        # Phase 11.4: with max_in_flight configured, a caller beyond the
-        # limit waits here (queues) rather than every excess submission
-        # being handed straight to the pool's own unbounded internal
-        # queue -- "allow tasks to queue instead of being silently
-        # dropped" is satisfied by `async with` blocking, not by
-        # rejecting anything. Acquired before submission and released in
-        # a finally -- guaranteed even if _submit() raises (a normal
-        # execution failure returns normally and releases the same way;
-        # a BrokenProcessPool propagating still releases before it does,
-        # so a permit can never leak just because the pool died).
-        async with self._semaphore:
-            return await self._submit(task_type, payload)
+            # Phase 11.4: with max_in_flight configured, a caller beyond
+            # the limit waits here (queues) rather than every excess
+            # submission being handed straight to the pool's own
+            # unbounded internal queue -- "allow tasks to queue instead
+            # of being silently dropped" is satisfied by `async with`
+            # blocking, not by rejecting anything. Acquired before
+            # submission and released in a finally -- guaranteed even if
+            # _run_and_record() raises (a normal execution failure
+            # returns normally and releases the same way; a
+            # BrokenProcessPool propagating still releases before it
+            # does, so a permit can never leak just because the pool
+            # died).
+            wait_start = time.perf_counter()
+            async with self._semaphore:
+                self._metrics.total_wait_time += time.perf_counter() - wait_start
+                return await self._run_and_record(task_type, payload)
+        except Exception:
+            # Phase 11.5: everything that reaches here is a raise, not a
+            # normal {"status": "error", ...} result (those are counted
+            # as `failed` inside _run_and_record instead) -- i.e. exactly
+            # the BACKEND-failure category from this class's own
+            # docstring (a dead child process, or execute() called after
+            # stop()). asyncio.CancelledError is a BaseException, not an
+            # Exception, since Python 3.8 -- this deliberately does NOT
+            # catch it, so a caller cancelling this coroutine (while
+            # waiting for the semaphore or for the pool result) is never
+            # miscounted as a backend error.
+            self._metrics.backend_errors += 1
+            raise
+
+    async def _run_and_record(self, task_type: str, payload: dict) -> dict:
+        self._metrics.running += 1
+        exec_start = time.perf_counter()
+        try:
+            result = await self._submit(task_type, payload)
+        finally:
+            # Runs on success, on a normal execution-failure result, AND
+            # on a raise (BrokenProcessPool, or cancellation) -- `running`
+            # must never stay stuck incremented just because the task
+            # didn't finish cleanly.
+            self._metrics.running -= 1
+        self._metrics.total_execution_time += time.perf_counter() - exec_start
+        if result["status"] == "success":
+            self._metrics.completed += 1
+        else:
+            self._metrics.failed += 1
+        return result
+
+    def get_metrics(self) -> BackendMetrics:
+        return replace(self._metrics)
 
     async def _submit(self, task_type: str, payload: dict) -> dict:
         # Re-check here, not just in execute(): a call that was waiting on
