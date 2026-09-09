@@ -133,7 +133,8 @@ def execute_map(payload: dict):
 
     `execution_mode: "serialized_callable"` (alongside `callable`, same
     field as the EXECUTE envelope) selects an arbitrary serialized
-    callable instead of any name lookup -- see jobs.map.build_map_job_serialized.
+    callable instead of any name lookup -- see jobs.models.ExecutionSpec.serialized
+    and jobs.map.build_map_job.
     """
     data = payload.get("data")
     if not isinstance(data, list):

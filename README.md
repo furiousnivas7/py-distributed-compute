@@ -217,6 +217,80 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+## Getting Started (Python API)
+
+This is the minimal path through the public API -- see `master/__init__.py`,
+`worker/__init__.py`, and `jobs/__init__.py` for the complete stable
+surface (deep imports like `master.scheduler.Scheduler` keep working too;
+these packages just add convenient top-level re-exports).
+
+Register a function, start a worker (in-process, `DirectBackend`), and
+submit a call to it:
+
+```python
+import asyncio
+from master import scheduler, start_master, stop_master, wait_for_tasks
+from worker import DirectBackend, register_function, run_worker
+from jobs import submit_call, collect_call_result
+
+register_function("double", lambda x: x * 2)
+
+async def main():
+    server = await start_master("127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    worker_task = asyncio.create_task(
+        run_worker(host, port, worker_id="worker-1", backend=DirectBackend())
+    )
+
+    task = submit_call(scheduler, "t1", "double", x=21)
+    [response] = await wait_for_tasks({task.task_id})
+    print(collect_call_result(response))  # 42
+
+    worker_task.cancel()
+    await stop_master()
+
+asyncio.run(main())
+```
+
+A serialized callable -- an arbitrary function that was never registered
+anywhere (see "Security Considerations" below before using this on a
+cluster you don't fully trust):
+
+```python
+from jobs import submit_serialized_call
+
+task = submit_serialized_call(scheduler, "t2", lambda x: x * x, args=[6])
+[response] = await wait_for_tasks({task.task_id})
+print(collect_call_result(response))  # 36
+```
+
+A full MapReduce job:
+
+```python
+from jobs import run_map_reduce
+from master.async_server import drain_tasks_for
+
+result = await run_map_reduce(
+    scheduler, drain_tasks_for, "job-1",
+    data=["a", "b", "a", "c", "b", "c"],
+    map_operation="WORD_COUNT",
+    reduce_operation="SUM",
+    num_partitions=2,
+)
+# {"a": 2, "b": 2, "c": 2}
+```
+
+A `MultiprocessingBackend` worker instead of `DirectBackend` (see
+"Execution Backend Configuration" below for CLI/environment-driven
+selection):
+
+```python
+from worker import MultiprocessingBackend
+
+backend = MultiprocessingBackend(max_workers=4, max_in_flight=8)
+worker_task = asyncio.create_task(run_worker(host, port, backend=backend))
+```
+
 ## Usage
 
 Start the master:
@@ -346,7 +420,8 @@ Output:
 
 **Serialized callables are executable code, not data.** The engine supports
 submitting an arbitrary Python function (`jobs.call.submit_serialized_call`,
-`jobs.map.build_map_job_serialized`, `jobs.reduce.build_reduce_job_serialized`)
+or `jobs.map.build_map_job`/`jobs.reduce.build_reduce_job` given an
+`ExecutionSpec.serialized(fn)` operation)
 by serializing it with `cloudpickle` and shipping it to a worker, which
 deserializes and calls it. A worker that accepts and runs one is trusting
 whatever produced it exactly as much as it trusts its own source code --
