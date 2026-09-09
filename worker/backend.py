@@ -237,7 +237,11 @@ class MultiprocessingBackend(ExecutionBackend):
         # this method returns, resetting self._pool/self._semaphore above
         # means that suspended call resumes into a pool-is-None
         # RuntimeError the next time it's scheduled, the same clear
-        # failure execute() already raises for any other post-stop call.
+        # failure execute() already raises for any other post-stop call --
+        # see _submit()'s own self._pool check, which is what actually
+        # makes that true rather than silently falling through to
+        # run_in_executor's None-means-"use the default thread pool"
+        # behavior.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: pool.shutdown(wait=True, cancel_futures=True))
 
@@ -262,6 +266,18 @@ class MultiprocessingBackend(ExecutionBackend):
             return await self._submit(task_type, payload)
 
     async def _submit(self, task_type: str, payload: dict) -> dict:
+        # Re-check here, not just in execute(): a call that was waiting on
+        # self._semaphore when stop() ran only resumes once whatever
+        # currently holds the permit releases it (stop()'s
+        # pool.shutdown(wait=True, ...) already waits for that) -- by then
+        # self._pool has been reset to None. Without this check,
+        # run_in_executor(self._pool, ...) would receive None and silently
+        # fall back to Python's own default thread pool executor instead
+        # of failing clearly -- exactly the "silently degrades instead of
+        # resolving with an explicit error" gap this check closes.
+        if self._pool is None:
+            raise RuntimeError("MultiprocessingBackend.execute() called before start() (or after stop())")
+
         # run_in_executor returns immediately with an awaitable -- this
         # does NOT block the event loop while the child process runs;
         # other coroutines (the heartbeat loop, a shutdown watcher,

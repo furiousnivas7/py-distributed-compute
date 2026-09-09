@@ -485,3 +485,65 @@ def test_shutdown_while_tasks_are_queued_in_the_pool_does_not_hang():
     assert len(results) == 3
     for result in results:
         assert result is not None  # every call resolved somehow, none left pending
+
+
+def test_shutdown_while_tasks_are_waiting_for_in_flight_capacity_does_not_hang():
+    """The gap the queued-in-the-pool test above doesn't cover: with
+    max_in_flight configured, tasks 2 and 3 never even reach the pool --
+    they're suspended on `async with self._semaphore`, a DIFFERENT
+    suspension point than pool-level queuing. stop() must still resolve
+    them rather than leaving them blocked forever on a semaphore object
+    that stop() can no longer signal by simply setting self._semaphore =
+    None (that reassignment doesn't affect a waiter already suspended on
+    the OLD semaphore instance -- see _submit's own self._pool recheck,
+    which is what actually makes this resolve instead of hang or silently
+    fall back to the default thread pool executor)."""
+    registry.register_function("slow", _sleep_briefly)
+
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=1, max_in_flight=1)
+        await backend.start()
+
+        exec_tasks = [asyncio.create_task(backend.execute("slow", {})) for _ in range(3)]
+        await asyncio.sleep(0.05)  # let the first one acquire the permit and start running
+
+        await asyncio.wait_for(backend.stop(), timeout=5)
+
+        return await asyncio.wait_for(
+            asyncio.gather(*exec_tasks, return_exceptions=True), timeout=5
+        )
+
+    results = asyncio.run(scenario())
+    assert len(results) == 3
+    # The first task had already started running before stop() -- it must
+    # complete normally, not be punished for having a head start.
+    assert results[0] == {"status": "success", "result": "done"}
+    # Tasks 2 and 3 were still waiting for a permit when stop() ran --
+    # they must resolve with a clear, explicit error (never silently
+    # succeed by running on the wrong executor, and never hang).
+    for result in results[1:]:
+        assert isinstance(result, RuntimeError)
+
+
+def test_semaphore_is_recreated_on_restart_after_stop():
+    """start()/stop()/start() must produce a backend that works again --
+    not one permanently wedged on the semaphore object from its first
+    lifetime. start() unconditionally builds a fresh asyncio.Semaphore
+    each call, so a restarted backend must be able to run max_in_flight
+    tasks again without deadlocking on a stale reference."""
+    registry.register_function("noop", lambda: "ok")
+
+    async def scenario():
+        backend = MultiprocessingBackend(max_workers=2, max_in_flight=1)
+        await backend.start()
+        first = await asyncio.wait_for(backend.execute("noop", {}), timeout=5)
+        await backend.stop()
+
+        await backend.start()
+        second = await asyncio.wait_for(backend.execute("noop", {}), timeout=5)
+        await backend.stop()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first == {"status": "success", "result": "ok"}
+    assert second == {"status": "success", "result": "ok"}
