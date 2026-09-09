@@ -20,7 +20,7 @@ from rpc.async_connection import AsyncConnection
 from rpc.async_rpc import new_request_id, receive_message, send_message, send_request
 from rpc.protocol import build_message
 from worker.backend import DirectBackend, ExecutionBackend
-from worker.config import build_backend, resolve_backend_config
+from worker.config import build_backend, resolve_backend_config, resolve_worker_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -286,6 +286,12 @@ def main() -> None:
     try:
         config = resolve_backend_config()
         backend = build_backend(config)
+        # Phase 12.3: WHERE/WHO this worker is (master host/port, its own
+        # id/host/port) is now resolved the same CLI/env/defaults way as
+        # the backend -- previously hardcoded module constants, meaning
+        # two worker processes on the same machine (or one pointed at a
+        # non-default master) required editing this file's source.
+        runtime = resolve_worker_runtime_config()
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
@@ -296,7 +302,19 @@ def main() -> None:
     # matching this file's existing print()-for-human-visible-status-lines
     # convention (see the PING/REGISTER status prints in run_worker below).
     print(f"Selected backend: {backend.describe()}")
-    asyncio.run(run_worker(MASTER_HOST, MASTER_PORT, backend=backend))
+    print(
+        f"Worker {runtime.worker_id} connecting to {runtime.master_host}:{runtime.master_port}"
+    )
+    asyncio.run(
+        run_worker(
+            runtime.master_host,
+            runtime.master_port,
+            worker_id=runtime.worker_id,
+            worker_host=runtime.worker_host,
+            worker_port=runtime.worker_port,
+            backend=backend,
+        )
+    )
 
 
 if __name__ == "__main__":

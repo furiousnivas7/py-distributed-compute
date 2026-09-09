@@ -16,8 +16,10 @@ that validation runs exactly once, in exactly one place.
 import argparse
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 
+from common.env import ENV_MASTER_HOST, ENV_MASTER_PORT
 from worker.backend import DirectBackend, ExecutionBackend, MultiprocessingBackend
 
 logger = logging.getLogger(__name__)
@@ -26,8 +28,16 @@ ENV_BACKEND = "PY_DISTRIBUTED_BACKEND"
 ENV_MAX_WORKERS = "PY_DISTRIBUTED_MAX_WORKERS"
 ENV_MAX_IN_FLIGHT = "PY_DISTRIBUTED_MAX_IN_FLIGHT"
 ENV_MP_CONTEXT = "PY_DISTRIBUTED_MP_CONTEXT"
+ENV_WORKER_ID = "PY_DISTRIBUTED_WORKER_ID"
+ENV_WORKER_HOST = "PY_DISTRIBUTED_WORKER_HOST"
+ENV_WORKER_PORT = "PY_DISTRIBUTED_WORKER_PORT"
 
 VALID_BACKENDS = ("direct", "multiprocessing")
+
+DEFAULT_MASTER_HOST = "127.0.0.1"
+DEFAULT_MASTER_PORT = 5000
+DEFAULT_WORKER_HOST = "127.0.0.1"
+DEFAULT_WORKER_PORT = 6001
 
 
 @dataclass(frozen=True)
@@ -40,6 +50,25 @@ class BackendConfig:
     max_workers: int | None = None
     max_in_flight: int | None = None
     mp_context: str = "fork"
+
+
+@dataclass(frozen=True)
+class WorkerRuntimeConfig:
+    """Phase 12.3: WHERE and WHO a worker process is -- deliberately
+    separate from BackendConfig (WHAT it executes with), a distinct
+    concern resolved from the same CLI-args/env-vars/defaults precedence.
+    Every field here was already a plain parameter to run_worker() since
+    Phase 9/11.1 -- this only adds a CLI/env-driven way to supply them
+    instead of the async_worker module's own hardcoded constants, so two
+    worker processes on the same machine (or a worker pointed at a
+    non-default master) don't require editing source to run.
+    """
+
+    master_host: str
+    master_port: int
+    worker_id: str
+    worker_host: str
+    worker_port: int
 
 
 def _parse_int(field_name: str, raw: str) -> int:
@@ -106,6 +135,42 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "then 'fork'. Ignored by the direct backend."
         ),
     )
+    parser.add_argument(
+        "--master-host",
+        default=None,
+        help=f"Master host to connect to. Falls back to {ENV_MASTER_HOST}, then {DEFAULT_MASTER_HOST!r}.",
+    )
+    parser.add_argument(
+        "--master-port",
+        default=None,
+        help=f"Master port to connect to. Falls back to {ENV_MASTER_PORT}, then {DEFAULT_MASTER_PORT}.",
+    )
+    parser.add_argument(
+        "--worker-id",
+        default=None,
+        help=(
+            f"This worker's id, reported to the master on REGISTER. Falls back to "
+            f"{ENV_WORKER_ID}, then a randomly generated id (so multiple workers "
+            "started without this flag never collide)."
+        ),
+    )
+    parser.add_argument(
+        "--worker-host",
+        default=None,
+        help=(
+            f"This worker's own host, reported to the master as metadata (Phase 8+ "
+            f"never dials back to it). Falls back to {ENV_WORKER_HOST}, then "
+            f"{DEFAULT_WORKER_HOST!r}."
+        ),
+    )
+    parser.add_argument(
+        "--worker-port",
+        default=None,
+        help=(
+            f"This worker's own port, reported to the master as metadata. Falls "
+            f"back to {ENV_WORKER_PORT}, then {DEFAULT_WORKER_PORT}."
+        ),
+    )
     return parser
 
 
@@ -148,6 +213,53 @@ def resolve_backend_config(argv: list[str] | None = None, env: dict | None = Non
         config.max_workers,
         config.max_in_flight,
         config.mp_context,
+    )
+    return config
+
+
+def resolve_worker_runtime_config(argv: list[str] | None = None, env: dict | None = None) -> WorkerRuntimeConfig:
+    """Resolve WHERE/WHO a worker is -- same CLI/env/defaults precedence
+    and injectable argv/env as resolve_backend_config, from the SAME
+    shared parser (both functions parse their own subset of its flags out
+    of the same argv; the flags each doesn't care about are simply
+    unused, not an error -- see _build_arg_parser)."""
+    if env is None:
+        env = os.environ
+
+    args, _ = _build_arg_parser().parse_known_args(argv)
+
+    master_host = args.master_host or env.get(ENV_MASTER_HOST) or DEFAULT_MASTER_HOST
+    master_port_raw = args.master_port if args.master_port is not None else env.get(ENV_MASTER_PORT)
+    master_port = (
+        _parse_int("master_port", master_port_raw) if master_port_raw is not None else DEFAULT_MASTER_PORT
+    )
+
+    # No CLI/env value means a fresh random id per process, not a shared
+    # default -- unlike every other field here, "worker-1" for every
+    # worker that didn't set one would guarantee a collision the moment a
+    # second worker starts.
+    worker_id = args.worker_id or env.get(ENV_WORKER_ID) or f"worker-{uuid.uuid4().hex[:8]}"
+
+    worker_host = args.worker_host or env.get(ENV_WORKER_HOST) or DEFAULT_WORKER_HOST
+    worker_port_raw = args.worker_port if args.worker_port is not None else env.get(ENV_WORKER_PORT)
+    worker_port = (
+        _parse_int("worker_port", worker_port_raw) if worker_port_raw is not None else DEFAULT_WORKER_PORT
+    )
+
+    config = WorkerRuntimeConfig(
+        master_host=master_host,
+        master_port=master_port,
+        worker_id=worker_id,
+        worker_host=worker_host,
+        worker_port=worker_port,
+    )
+    logger.info(
+        "worker_runtime_config_resolved master_host=%s master_port=%s worker_id=%s worker_host=%s worker_port=%s",
+        config.master_host,
+        config.master_port,
+        config.worker_id,
+        config.worker_host,
+        config.worker_port,
     )
     return config
 

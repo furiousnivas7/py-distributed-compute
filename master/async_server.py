@@ -55,14 +55,20 @@ it.
 """
 
 import asyncio
+import logging
+import signal
+import sys
 
 from common.models import TaskStatus, WorkerStatus
 from master import rpc_handler
+from master.config import resolve_master_config
 from master.scheduler import Scheduler
 from rpc import protocol
 from rpc.async_connection import AsyncConnection
 from rpc.async_rpc import receive_message, send_message
 from rpc.protocol import ProtocolError, build_message
+
+logger = logging.getLogger(__name__)
 
 HOST = "127.0.0.1"
 PORT = 5000
@@ -860,8 +866,64 @@ async def run_server() -> None:
         await stop_master()
 
 
+async def serve_forever(host: str = HOST, port: int = PORT, stop_event: asyncio.Event | None = None) -> None:
+    """Phase 12.3: the real "just start the master and keep serving"
+    entry point -- unlike run_server() above (a fixed demo that waits for
+    exactly EXPECTED_WORKERS and submits 4 hardcoded tasks, kept
+    unchanged for whatever still relies on it), this accepts any number
+    of workers and any job submitted against `scheduler` by another
+    coroutine sharing this process (e.g. jobs.submit_call, run_map_reduce)
+    for as long as the process runs, until `stop_event` is set (Ctrl+C /
+    SIGTERM in main() below) or cancelled.
+
+    No new distributed-computing semantics here: this only calls
+    start_master/stop_master, both unchanged since Phase 9.3.
+    """
+    if stop_event is None:
+        stop_event = asyncio.Event()
+
+    await start_master(host, port)
+    logger.info("master_started host=%s port=%s", host, port)
+    print(f"Master listening on {host}:{port} (Ctrl+C to stop)")
+    try:
+        await stop_event.wait()
+    finally:
+        logger.info("master_stopping host=%s port=%s", host, port)
+        await stop_master()
+
+
 def main() -> None:
-    asyncio.run(run_server())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+
+    try:
+        config = resolve_master_config()
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+    async def _run() -> None:
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        # Unix-only (this project's existing platform stance -- see
+        # worker/backend.py's MultiprocessingBackend docstring): converts
+        # SIGINT/SIGTERM into a clean stop_event.set() so serve_forever's
+        # own finally (which calls stop_master()) actually runs, instead
+        # of a bare KeyboardInterrupt unwinding the event loop mid-await
+        # with no chance to close worker connections or stop the
+        # dispatcher cleanly. Falls back to a plain KeyboardInterrupt (no
+        # graceful stop_master()) wherever add_signal_handler isn't
+        # available (Windows).
+        try:
+            loop.add_signal_handler(signal.SIGINT, stop_event.set)
+            loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+        except NotImplementedError:
+            pass
+        await serve_forever(config.host, config.port, stop_event)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
