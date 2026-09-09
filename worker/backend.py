@@ -28,6 +28,7 @@ implement it correctly without a breaking interface change later.
 """
 
 import asyncio
+import logging
 import multiprocessing
 import time
 from abc import ABC, abstractmethod
@@ -35,6 +36,16 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 
 from worker.executor import execute_task
+
+# Phase 11.6: structured lifecycle/diagnostic logging -- deliberately the
+# stdlib logging module, not print(), so a caller can route, filter, or
+# silence this independently of the worker's own stdout (which
+# async_worker.py still uses print() for a couple of legacy status lines
+# outside this phase's scope). Every message here is a single-line
+# "event_name key=value ..." record and NEVER includes a task's payload
+# contents or a serialized callable's bytes -- only identifiers (task_type,
+# execution_mode, backend name, counts, exception TYPE names).
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -143,6 +154,25 @@ class ExecutionBackend(ABC):
         """
         return BackendMetrics()
 
+    def describe(self) -> dict[str, object]:
+        """Phase 11.6: diagnostic identity/capability metadata about this
+        backend -- for logging and troubleshooting only. NOT part of the
+        task execution protocol; nothing in serve_tasks(), the wire
+        protocol, or the scheduler reads this. Deterministic and JSON-
+        serializable (plain str/int/bool/None values only), so it's safe
+        to log or ship as-is. The base implementation covers every
+        backend that just wraps worker.executor.execute_task (true of
+        every backend in this codebase so far, hence
+        supports_serialized_callables defaulting to True here rather than
+        False) -- override to add backend-specific fields (see
+        MultiprocessingBackend).
+        """
+        return {
+            "backend": type(self).__name__,
+            "max_concurrency": self.max_concurrency,
+            "supports_serialized_callables": True,
+        }
+
 
 class DirectBackend(ExecutionBackend):
     """The baseline backend (Phase 11.1): runs worker.executor.execute_task
@@ -168,16 +198,34 @@ class DirectBackend(ExecutionBackend):
         # how a future change might add one).
         self._metrics.submitted += 1
         self._metrics.running += 1
+        logger.debug("task_submitted backend=DirectBackend task_type=%s", task_type)
         start = time.perf_counter()
         try:
             result = execute_task(task_type, payload)
         finally:
             self._metrics.running -= 1
-        self._metrics.total_execution_time += time.perf_counter() - start
+        elapsed = time.perf_counter() - start
+        self._metrics.total_execution_time += elapsed
         if result["status"] == "success":
             self._metrics.completed += 1
+            logger.debug(
+                "task_execution_completed backend=DirectBackend task_type=%s duration=%.4f",
+                task_type,
+                elapsed,
+            )
         else:
             self._metrics.failed += 1
+            # WARNING, not ERROR -- a structured execution failure is an
+            # expected, deterministic outcome (see ExecutionBackend.
+            # execute's docstring), not a system fault. Never logs
+            # result["message"] -- that can echo back caller-supplied
+            # argument values; the error `code` alone is enough to
+            # diagnose from logs without risking payload exposure.
+            logger.warning(
+                "task_execution_failed backend=DirectBackend task_type=%s code=%s",
+                task_type,
+                result.get("code"),
+            )
         return result
 
     def get_metrics(self) -> BackendMetrics:
@@ -276,10 +324,19 @@ class MultiprocessingBackend(ExecutionBackend):
         unchanged unless a caller explicitly opts in. If set, must also
         be a positive integer.
         """
+        # Phase 11.6: every message here states what was actually
+        # received, not just which field was wrong -- "invalid
+        # max_workers" forces a caller back to the source to find out
+        # what value they actually passed; naming it directly doesn't.
         if max_workers is not None and max_workers <= 0:
-            raise ValueError(f"max_workers must be a positive integer or None, got {max_workers}")
+            raise ValueError(f"max_workers must be a positive integer or None; received {max_workers!r}")
         if max_in_flight is not None and max_in_flight <= 0:
-            raise ValueError(f"max_in_flight must be a positive integer or None, got {max_in_flight}")
+            raise ValueError(f"max_in_flight must be a positive integer or None; received {max_in_flight!r}")
+        valid_contexts = ("fork", "spawn", "forkserver")
+        if mp_context not in valid_contexts:
+            raise ValueError(
+                f"mp_context must be one of {valid_contexts}; received {mp_context!r}"
+            )
 
         self._max_workers = max_workers
         self._mp_context = mp_context
@@ -288,12 +345,27 @@ class MultiprocessingBackend(ExecutionBackend):
         self._pool: ProcessPoolExecutor | None = None
         self.max_concurrency = max_in_flight if max_in_flight is not None else max_workers
         self._metrics = BackendMetrics()
+        logger.info(
+            "backend_created backend=MultiprocessingBackend max_workers=%s mp_context=%s max_in_flight=%s",
+            max_workers,
+            mp_context,
+            max_in_flight,
+        )
 
     async def start(self) -> None:
-        self._pool = ProcessPoolExecutor(
-            max_workers=self._max_workers,
-            mp_context=multiprocessing.get_context(self._mp_context),
-        )
+        try:
+            self._pool = ProcessPoolExecutor(
+                max_workers=self._max_workers,
+                mp_context=multiprocessing.get_context(self._mp_context),
+            )
+        except Exception:
+            logger.error(
+                "backend_start_failed backend=MultiprocessingBackend max_workers=%s mp_context=%s",
+                self._max_workers,
+                self._mp_context,
+                exc_info=True,
+            )
+            raise
         if self._max_in_flight is not None:
             self._semaphore = asyncio.Semaphore(self._max_in_flight)
         # Phase 11.5: metrics reset on every start(), matching the
@@ -303,12 +375,18 @@ class MultiprocessingBackend(ExecutionBackend):
         # accident: call get_metrics() before stop() if you need the
         # final numbers from a lifetime that's ending.
         self._metrics = BackendMetrics()
+        logger.info(
+            "backend_started backend=MultiprocessingBackend max_workers=%s max_in_flight=%s",
+            self._max_workers,
+            self._max_in_flight,
+        )
 
     async def stop(self) -> None:
         pool, self._pool = self._pool, None
         self._semaphore = None
         if pool is None:
             return
+        logger.info("backend_stopping backend=MultiprocessingBackend")
         # shutdown(wait=True, cancel_futures=True) cancels anything still
         # QUEUED inside the pool (not yet running) and blocks until every
         # child process actually terminates -- run it off the event loop
@@ -326,13 +404,21 @@ class MultiprocessingBackend(ExecutionBackend):
         # run_in_executor's None-means-"use the default thread pool"
         # behavior.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: pool.shutdown(wait=True, cancel_futures=True))
+        try:
+            await loop.run_in_executor(None, lambda: pool.shutdown(wait=True, cancel_futures=True))
+        except Exception:
+            logger.error("backend_stop_failed backend=MultiprocessingBackend", exc_info=True)
+            raise
+        logger.info("backend_stopped backend=MultiprocessingBackend")
 
     async def execute(self, task_type: str, payload: dict) -> dict:
         if self._pool is None:
-            raise RuntimeError("MultiprocessingBackend.execute() called before start()")
+            raise RuntimeError(
+                "MultiprocessingBackend.execute() called before start() (or after stop())"
+            )
 
         self._metrics.submitted += 1
+        logger.debug("task_submitted backend=MultiprocessingBackend task_type=%s", task_type)
         try:
             if self._semaphore is None:
                 return await self._run_and_record(task_type, payload)
@@ -353,7 +439,7 @@ class MultiprocessingBackend(ExecutionBackend):
             async with self._semaphore:
                 self._metrics.total_wait_time += time.perf_counter() - wait_start
                 return await self._run_and_record(task_type, payload)
-        except Exception:
+        except Exception as exc:
             # Phase 11.5: everything that reaches here is a raise, not a
             # normal {"status": "error", ...} result (those are counted
             # as `failed` inside _run_and_record instead) -- i.e. exactly
@@ -365,10 +451,28 @@ class MultiprocessingBackend(ExecutionBackend):
             # waiting for the semaphore or for the pool result) is never
             # miscounted as a backend error.
             self._metrics.backend_errors += 1
+            # Phase 11.6: process-pool failure diagnostics -- deliberately
+            # logs only identifiers (task_type, execution_mode, the
+            # exception's TYPE name) and counts, never payload
+            # contents/args/results and never a serialized callable's
+            # bytes. execution_mode is only present on EXECUTE-task
+            # payloads (Phase 10); "n/a" for everything else (built-ins,
+            # plain registered functions, MAP/REDUCE).
+            logger.error(
+                "process_pool_failed backend=MultiprocessingBackend task_type=%s "
+                "execution_mode=%s error=%s running_tasks=%d max_workers=%s max_in_flight=%s",
+                task_type,
+                payload.get("execution_mode", "n/a"),
+                type(exc).__name__,
+                self._metrics.running,
+                self._max_workers,
+                self._max_in_flight,
+            )
             raise
 
     async def _run_and_record(self, task_type: str, payload: dict) -> dict:
         self._metrics.running += 1
+        logger.debug("task_execution_started backend=MultiprocessingBackend task_type=%s", task_type)
         exec_start = time.perf_counter()
         try:
             result = await self._submit(task_type, payload)
@@ -378,15 +482,36 @@ class MultiprocessingBackend(ExecutionBackend):
             # must never stay stuck incremented just because the task
             # didn't finish cleanly.
             self._metrics.running -= 1
-        self._metrics.total_execution_time += time.perf_counter() - exec_start
+        elapsed = time.perf_counter() - exec_start
+        self._metrics.total_execution_time += elapsed
         if result["status"] == "success":
             self._metrics.completed += 1
+            logger.debug(
+                "task_execution_completed backend=MultiprocessingBackend task_type=%s duration=%.4f",
+                task_type,
+                elapsed,
+            )
         else:
             self._metrics.failed += 1
+            # WARNING, not ERROR -- same reasoning as DirectBackend's
+            # identical log: a structured execution failure is expected
+            # and deterministic, not a system fault. Never logs
+            # result["message"].
+            logger.warning(
+                "task_execution_failed backend=MultiprocessingBackend task_type=%s code=%s",
+                task_type,
+                result.get("code"),
+            )
         return result
 
     def get_metrics(self) -> BackendMetrics:
         return replace(self._metrics)
+
+    def describe(self) -> dict[str, object]:
+        info = super().describe()
+        info["max_workers"] = self._max_workers
+        info["max_in_flight"] = self._max_in_flight
+        return info
 
     async def _submit(self, task_type: str, payload: dict) -> dict:
         # Re-check here, not just in execute(): a call that was waiting on

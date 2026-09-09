@@ -12,12 +12,15 @@ coroutines can never interleave mid-message the way two OS threads could.
 """
 
 import asyncio
+import logging
 
 from rpc import protocol
 from rpc.async_connection import AsyncConnection
 from rpc.async_rpc import new_request_id, receive_message, send_message, send_request
 from rpc.protocol import build_message
 from worker.backend import DirectBackend, ExecutionBackend
+
+logger = logging.getLogger(__name__)
 
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 5000
@@ -183,6 +186,20 @@ async def run_worker(
             f"backend must be an ExecutionBackend instance (or None for the "
             f"default DirectBackend), got {type(backend).__name__}"
         )
+
+    # Phase 11.6: one INFO-level record before this worker touches the
+    # network at all -- worker_id, where it's connecting to, and its
+    # backend's full describe() (identity + capacity/capability metadata,
+    # e.g. max_concurrency, max_workers/max_in_flight for a
+    # MultiprocessingBackend) so a log reader can see how this worker is
+    # configured without cross-referencing its startup code.
+    logger.info(
+        "worker_starting worker_id=%s master_host=%s master_port=%s backend=%s",
+        worker_id,
+        master_host,
+        master_port,
+        backend.describe(),
+    )
 
     reader, writer = await asyncio.open_connection(master_host, master_port)
     conn = AsyncConnection(reader, writer)
