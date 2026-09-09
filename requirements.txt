@@ -1,2 +1,5 @@
-pytest>=7.0
-cloudpickle>=3.0
+# Phase 12.2: dependencies are now declared in pyproject.toml (the
+# authoritative source) -- this file is kept only as the familiar
+# `pip install -r requirements.txt` entry point, and just installs the
+# project itself (editable) plus its dev extra (pytest).
+-e .[dev]

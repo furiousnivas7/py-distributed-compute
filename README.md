@@ -211,11 +211,39 @@ Activate it on Linux or macOS:
 source .venv/bin/activate
 ```
 
-Install dependencies:
+Make sure `pip` is reasonably current first -- a venv's `ensurepip`-bundled
+pip can be too old to support this project's `pyproject.toml`-only
+editable installs (PEP 660):
 
 ```bash
-pip install -r requirements.txt
+pip install --upgrade pip
 ```
+
+Install the project in editable mode, plus development dependencies
+(`pytest`) needed to run the test suite:
+
+```bash
+pip install -e .[dev]
+```
+
+(`pip install -r requirements.txt` does exactly the same thing -- kept as
+the familiar entry point.) For a runtime-only install with no dev
+dependencies, drop the extra: `pip install -e .` -- or `pip install .`
+for a normal (non-editable) install. `cloudpickle` is the only runtime
+dependency (see `pyproject.toml`); it's installed automatically either
+way.
+
+### Building and installing a wheel
+
+```bash
+pip install build
+python -m build
+pip install dist/py_distributed_compute-0.1.0-py3-none-any.whl
+```
+
+The public API (`master`, `worker`, `jobs`, `common` -- see "Getting
+Started" below) then works from any directory, with no dependency on the
+repository being on `PYTHONPATH` or the current working directory.
 
 ## Getting Started (Python API)
 

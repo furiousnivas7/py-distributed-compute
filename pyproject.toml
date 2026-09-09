@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-distributed-compute"
+version = "0.1.0"
+description = "A distributed computing engine built from scratch in Python: master-worker architecture, a custom TCP RPC protocol, MapReduce, and pluggable execution backends."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Nivash_sharma", email = "nivasmathu@gmail.com" }]
+
+# Phase 12.2: audited against actual `import`/`from` statements in
+# master/, worker/, jobs/, common/, rpc/ (production code only, never
+# tests/) -- cloudpickle is the ONLY third-party runtime dependency;
+# everything else imported there (asyncio, argparse, dataclasses, typing,
+# concurrent.futures, socket, struct, threading, uuid, json, logging, ...)
+# is stdlib. Not copied blindly from requirements.txt, which also listed
+# pytest -- a test-only dependency, moved to the `dev` extra below instead.
+dependencies = ["cloudpickle>=3.0"]
+
+[project.optional-dependencies]
+# pytest only, deliberately -- this project has no pytest-asyncio
+# dependency (see tests/conftest.py's own docstring): every async test
+# drives its own asyncio.run() inside a plain `def test_...()`.
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+# Explicit list, not automatic discovery -- this repo has no src/ layout
+# and several unrelated top-level directories with their own __init__.py
+# (tests/) that must NOT be picked up as installable packages. `worker`/
+# `master`/`jobs`/`common`/`rpc` are generic names that could collide with
+# an unrelated PyPI package of the same name in a shared environment --
+# a known, deliberately deferred issue (Phase 12.2 scope is "make the
+# existing architecture installable," not renaming it); a namespace
+# migration (e.g. everything under a single `py_distributed_compute`
+# package) is a breaking change to leave for a separate phase.
+packages = ["common", "jobs", "master", "rpc", "worker"]
