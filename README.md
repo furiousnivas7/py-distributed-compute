@@ -6,49 +6,55 @@ The system allows a large data-processing job to be divided into smaller tasks a
 
 This project is designed to explore the fundamentals of distributed systems, custom network protocols, asynchronous programming, parallel processing, and fault tolerance.
 
+**Documentation:** this README covers installation, the Python API, the
+CLI, and configuration. For more depth, see
+[`docs/architecture.md`](docs/architecture.md) (how the pieces fit
+together — RPC protocol, task lifecycle, scheduling, MapReduce data flow,
+execution backends), [`docs/api.md`](docs/api.md) (the full public API
+reference), [`docs/development.md`](docs/development.md) (dev setup,
+testing, troubleshooting), and [`examples/`](examples/) (runnable
+scripts, one per feature).
+
 ## Features
 
-- Master-worker architecture
-- Custom TCP-based RPC protocol
-- Worker registration and management
-- Asynchronous communication using `asyncio`
-- Parallel task execution using `multiprocessing`
-- MapReduce programming model
+- Master-worker architecture, one persistent TCP connection per worker
+- Custom TCP-based RPC protocol (`rpc/protocol.py`)
+- Worker registration, heartbeat monitoring, and generation-based reconnection after a crash
+- Fully asynchronous master and worker (`asyncio`)
+- Parallel task execution via a `multiprocessing` execution backend (opt-in; `DirectBackend` in-process execution is the default)
+- MapReduce programming model (Map → Shuffle → Reduce)
 - Remote execution of registered functions and serialized Python callables
-- Task scheduling and load distribution
-- Worker heartbeat monitoring
-- Failed-task detection and retry
-- Job and task status tracking
-- Command-line interface
-- Structured logging
-- Performance benchmarking
-- Docker-based multi-worker deployment
+- Task scheduling, dispatch, and automatic retry on worker/transport failure (never on a deterministic execution failure — see "Retry Semantics" below)
+- Structured logging (`logging`, not `print`) for lifecycle and diagnostic events
+- `pydc` command-line interface (`master`/`worker`/`run` subcommands)
+- Installable via `pip` (editable install or a built wheel)
 
 ## Architecture
 
 ```text
-                         Client
+              Your code, in the SAME process as the master
+              (scheduler.submit_task / jobs.submit_call / ...)
                            |
                            v
                     +--------------+
                     |    Master    |
                     |              |
-                    | Job Manager  |
-                    | Scheduler   |
-                    | Worker Pool |
-                    | Fault Check |
+                    | Scheduler    |
+                    | WorkerManager|
+                    | Dispatcher   |
                     +------+-------+
                            |
                      Custom TCP RPC
+                    (one persistent connection
+                       per worker)
                            |
              +-------------+-------------+
              |             |             |
              v             v             v
        +-----------+ +-----------+ +-----------+
        | Worker 1  | | Worker 2  | | Worker 3  |
-       |           | |           | |           |
-       | Process 1 | | Process 1 | | Process 1 |
-       | Process 2 | | Process 2 | | Process 2 |
+       | Execution | | Execution | | Execution |
+       |  Backend  | |  Backend  | |  Backend  |
        +-----------+ +-----------+ +-----------+
              |             |             |
              +-------------+-------------+
@@ -57,9 +63,18 @@ This project is designed to explore the fundamentals of distributed systems, cus
                     Final Result
 ```
 
-## How It Works
+There is no separate network-facing "client" protocol — job submission
+happens by calling the master's public API directly (see "Getting
+Started" below). For the full picture (the wire protocol, task lifecycle
+and retry semantics, worker generations, MapReduce data flow, and the
+execution-backend abstraction), see
+[`docs/architecture.md`](docs/architecture.md).
 
-The system follows this workflow:
+## How MapReduce Works
+
+This is the MapReduce path specifically — the engine also supports a
+single function call with no Map/Reduce involved at all (see "Example
+Jobs" below). For a MapReduce job:
 
 ```text
 Submit Job
@@ -91,105 +106,82 @@ Return Output
 
 If a worker fails during execution, the master detects the failure and reschedules its unfinished tasks to another available worker.
 
-## Example
-
-For an input file containing:
-
-```text
-apple banana apple
-orange apple banana
-```
-
-The Map stage produces:
-
-```text
-apple  -> 1
-banana -> 1
-apple  -> 1
-orange -> 1
-apple  -> 1
-banana -> 1
-```
-
-The Reduce stage produces:
-
-```text
-apple  -> 3
-banana -> 2
-orange -> 1
-```
-
 ## Project Status
 
-This project is being developed incrementally.
-
-### Development phases
-
-- [ ] Phase 1: Basic TCP client and server
-- [ ] Phase 2: Custom RPC protocol
-- [ ] Phase 3: Worker registration
-- [ ] Phase 4: Worker heartbeat monitoring
-- [ ] Phase 5: Task scheduler
-- [ ] Phase 6: Basic MapReduce execution
-- [ ] Phase 7: Async communication with `asyncio`
-- [ ] Phase 8: Parallel execution with `multiprocessing`
-- [ ] Phase 9: Task retry and fault tolerance
-- [ ] Phase 10: CLI and monitoring
-- [ ] Phase 11: Testing and benchmarking
-- [ ] Phase 12: Docker deployment
+Actively developed, incrementally, in small reviewed phases (each with
+its own tests and validation before moving on). The engine is
+functional end-to-end: master/worker networking, scheduling and retry,
+MapReduce, two execution backends, a CLI, and packaging are all built
+and tested (500+ tests). Current work is on documentation and developer
+experience (this document and `docs/`/`examples/`) rather than new
+distributed-systems functionality — see "Future Improvements" below for
+what's deliberately not built yet.
 
 ## Technology Stack
 
-- **Language:** Python 3.11+
-- **Networking:** TCP sockets
-- **Communication:** Custom JSON-based RPC
-- **Concurrency:** `asyncio`
-- **Parallelism:** `multiprocessing`
+- **Language:** Python 3.10+
+- **Networking:** raw TCP sockets, a custom length-prefixed JSON RPC protocol (`rpc/`)
+- **Concurrency:** `asyncio` (the master and worker are both fully async)
+- **Parallelism:** `multiprocessing`, via an opt-in execution backend (`worker/backend.py`)
+- **Serialization:** `cloudpickle`, for arbitrary-callable execution (the one third-party runtime dependency)
 - **Testing:** `pytest`
 - **Logging:** Python `logging`
-- **Containerization:** Docker
-- **Version control:** Git and GitHub
+- **Packaging:** `setuptools`/`pyproject.toml` (PEP 621)
+- **Version control:** Git
 
-## Planned Project Structure
+## Project Structure
 
 ```text
 py-distributed-compute/
 │
-├── master/
-│   ├── server.py
+├── master/            async master: scheduler, worker registry, dispatch
+│   ├── async_server.py    the real implementation (Phase 8.9+)
+│   ├── config.py          host/port CLI+env resolution
 │   ├── scheduler.py
-│   └── worker_manager.py
+│   ├── worker_manager.py
+│   ├── rpc_handler.py
+│   └── server.py           earlier synchronous implementation (kept for its own tests)
 │
-├── worker/
-│   ├── worker.py
-│   └── executor.py
+├── worker/             async worker: execution, backends, registry
+│   ├── async_worker.py    the real implementation (Phase 9+)
+│   ├── backend.py         ExecutionBackend / DirectBackend / MultiprocessingBackend
+│   ├── config.py          backend + runtime CLI+env resolution
+│   ├── executor.py        task_type -> result, the execution contract
+│   ├── registry.py        register_function/register
+│   ├── serialization.py   cloudpickle isolation boundary
+│   └── worker.py           earlier synchronous implementation (kept for its own tests)
 │
-├── rpc/
+├── rpc/                wire protocol and transport
 │   ├── protocol.py
-│   └── connection.py
+│   ├── async_connection.py / async_rpc.py
+│   └── connection.py       synchronous counterpart
 │
-├── jobs/
-│   ├── map.py
-│   └── reduce.py
+├── jobs/               job submission and orchestration
+│   ├── call.py             single registered/serialized calls
+│   ├── map.py / reduce.py / shuffle.py / map_reduce.py
+│   └── models.py           ExecutionSpec, IntermediateResult
 │
-├── common/
-│   ├── models.py
-│   └── logger.py
+├── common/             shared data models
+│   ├── models.py           Task, Worker, their status enums
+│   └── env.py              env-var names shared by master/worker CLIs
 │
-├── tests/
+├── docs/               architecture.md, api.md, development.md
+├── examples/           runnable, tested example scripts
+├── tests/              500+ tests
 │
-├── client.py
+├── client.py           pydc CLI entry point
+├── pyproject.toml
 ├── requirements.txt
-├── README.md
-└── .gitignore
+└── README.md
 ```
 
 ## Installation
 
-Clone the repository:
+Clone the repository (replace the URL below with wherever you cloned
+this from):
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/py-distributed-compute.git
+git clone <your-fork-or-clone-url>/py-distributed-compute.git
 cd py-distributed-compute
 ```
 
@@ -464,32 +456,32 @@ worker trusts regardless of backend.
 
 ## Example Jobs
 
-The engine will initially support:
+See [`examples/`](examples/) for runnable scripts covering every pattern
+below — each one is also run by `tests/test_examples.py`, so they're
+guaranteed to still work against the current code.
 
-- Word count
-- Line count
-- Character frequency
-- Log analysis
-- CSV aggregation
-- Numerical data processing
+Built-in operations, no custom code needed (`worker/executor.py`):
 
-Example:
+- **Single call**: `ADD`, `MULTIPLY`
+- **Map**: `WORD_COUNT`, and the rest of `MAP_OPERATIONS`
+- **Reduce**: `SUM`, `COUNT`, `MAX`, `MIN`, and the rest of `REDUCE_OPERATIONS`
+
+Word count, end to end (`examples/04_map_reduce.py`):
 
 ```text
-Input:
-server.log
-
-Map:
-Extract HTTP status codes
-
-Reduce:
-Count each status code
-
-Output:
-200: 15420
-404: 832
-500: 47
+Input:  ["apple", "banana", "apple", "orange", "banana", "apple"]
+Map:    WORD_COUNT   (each word -> [word, 1])
+Shuffle: group by word
+Reduce: SUM           (sum each word's 1s)
+Output: {"apple": 3, "banana": 2, "orange": 1}
 ```
+
+Beyond the built-ins: a **registered function** (`worker.register_function`,
+`examples/01_registered_function.py`) for code the worker operator
+already trusts, or a **serialized callable**
+(`jobs.submit_serialized_call`, `examples/02_serialized_callable.py`)
+for an arbitrary function shipped as data — see "Security
+Considerations" below for the trust boundary between the two.
 
 ## Security Considerations
 
@@ -583,20 +575,34 @@ This project is intended to develop practical knowledge of:
 - Logging and observability
 - Performance analysis
 - Software testing
-- Docker deployment
+- Packaging and CLI design
 
 ## Future Improvements
 
-- Persistent job metadata
-- Worker resource tracking
-- Task prioritization
-- Dynamic worker discovery
-- Data locality
-- Intermediate-result storage
+Deliberately not built yet — some explicitly deferred by name in past
+phase reviews, kept here as a single honest list rather than scattered
+across docstrings:
+
+- Remote job submission to an already-running master (see
+  `docs/architecture.md`'s note on why `pydc run` is local-only today —
+  this needs a new client-facing wire-protocol message)
+- Persistent job metadata (everything is in-memory; a master restart
+  loses all task/worker state)
+- Worker resource tracking (CPU/memory), task prioritization, and
+  scheduler-level backpressure (explicitly out of scope through Phase
+  11.4 — see `worker/backend.py`'s concurrency-controls docstrings)
+- Dynamic worker discovery / data locality
+- Intermediate-result storage beyond one job's in-memory `IntermediateResultStore`
 - Job cancellation
-- Authentication between workers and master
+- Authentication between workers and master (the wire protocol has none
+  today — see "Security Considerations")
 - Web-based monitoring dashboard
 - Distributed file storage
+- Docker-based deployment
+- A namespace migration for the top-level package names (`master`,
+  `worker`, etc. are generic and could collide with an unrelated
+  package in a shared environment — a known, deliberately deferred
+  issue from the packaging phase)
 - More advanced scheduling algorithms
 
 ## Contributing
