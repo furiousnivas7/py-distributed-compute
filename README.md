@@ -12,8 +12,11 @@ CLI, and configuration. For more depth, see
 together — RPC protocol, task lifecycle, scheduling, MapReduce data flow,
 execution backends), [`docs/api.md`](docs/api.md) (the full public API
 reference), [`docs/development.md`](docs/development.md) (dev setup,
-testing, troubleshooting), and [`examples/`](examples/) (runnable
-scripts, one per feature).
+testing, troubleshooting), [`docs/security.md`](docs/security.md) (the
+current trust boundaries — read this before deploying anywhere beyond a
+trusted network), [`docs/performance_baseline.md`](docs/performance_baseline.md)
+(measured throughput/latency numbers), and [`examples/`](examples/)
+(runnable scripts, one per feature).
 
 ## Features
 
@@ -108,14 +111,18 @@ If a worker fails during execution, the master detects the failure and reschedul
 
 ## Project Status
 
-Actively developed, incrementally, in small reviewed phases (each with
-its own tests and validation before moving on). The engine is
-functional end-to-end: master/worker networking, scheduling and retry,
-MapReduce, two execution backends, a CLI, and packaging are all built
-and tested (500+ tests). Current work is on documentation and developer
-experience (this document and `docs/`/`examples/`) rather than new
-distributed-systems functionality — see "Future Improvements" below for
-what's deliberately not built yet.
+**`v0.2.0` — a hardened engineering prototype, not a `v1.0.0` release.**
+See [`docs/release_decision.md`](docs/release_decision.md) for the full
+reasoning: the engine, retry/fault-tolerance, and test coverage
+(600+ tests, including end-to-end, concurrency/stress, failure-injection,
+and resource-leak suites) are solid, but there's no authentication/
+encryption/authorization, no remote job submission to an already-running
+master, and no state persistence — real gaps for a "1.0," not oversights.
+See [`docs/security.md`](docs/security.md) for the trust boundary this
+implies.
+
+Developed incrementally, in small reviewed phases, each with its own
+tests and validation before moving on.
 
 ## Technology Stack
 
@@ -165,9 +172,12 @@ py-distributed-compute/
 │   ├── models.py           Task, Worker, their status enums
 │   └── env.py              env-var names shared by master/worker CLIs
 │
-├── docs/               architecture.md, api.md, development.md
+├── docs/               architecture.md, api.md, development.md,
+│                       security.md, performance_baseline.md,
+│                       release_decision.md
 ├── examples/           runnable, tested example scripts
-├── tests/              500+ tests
+├── scripts/            benchmark.py (performance baseline)
+├── tests/              600+ tests
 │
 ├── client.py           pydc CLI entry point
 ├── pyproject.toml
@@ -240,7 +250,7 @@ way.
 ```bash
 pip install build
 python -m build
-pip install dist/py_distributed_compute-0.1.0-py3-none-any.whl
+pip install dist/py_distributed_compute-0.2.0-py3-none-any.whl
 ```
 
 The public API (`master`, `worker`, `jobs`, `common` -- see "Getting

@@ -97,7 +97,7 @@ def outside_repo_dir(tmp_path_factory):
 def test_build_metadata():
     pyproject = (REPO_ROOT / "pyproject.toml").read_text()
     assert 'name = "py-distributed-compute"' in pyproject
-    assert 'version = "0.1.0"' in pyproject
+    assert 'version = "0.2.0"' in pyproject
     assert 'requires-python = ">=3.10"' in pyproject
     assert 'build-backend = "setuptools.build_meta"' in pyproject
 
@@ -148,14 +148,14 @@ def test_import_from_outside_repo(clean_installed_venv, outside_repo_dir):
 
 def test_wheel_build(built_wheel):
     assert built_wheel.exists()
-    assert built_wheel.name.startswith("py_distributed_compute-0.1.0-")
+    assert built_wheel.name.startswith("py_distributed_compute-0.2.0-")
     assert built_wheel.suffix == ".whl"
 
 
 def test_wheel_install(clean_installed_venv):
     result = _run([str(clean_installed_venv), "-m", "pip", "show", "py-distributed-compute"])
     assert result.returncode == 0
-    assert "Version: 0.1.0" in result.stdout
+    assert "Version: 0.2.0" in result.stdout
 
 
 # -- 12.2.6: public API survives installation ------------------------------

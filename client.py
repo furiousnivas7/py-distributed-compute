@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - importlib.metadata is stdlib on 3.10+
     from importlib_metadata import PackageNotFoundError, version
 
 _DISTRIBUTION_NAME = "py-distributed-compute"
-_FALLBACK_VERSION = "0.1.0"  # kept in sync with pyproject.toml's version
+_FALLBACK_VERSION = "0.2.0"  # kept in sync with pyproject.toml's version
 
 
 def _version_string() -> str:

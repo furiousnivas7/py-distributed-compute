@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py-distributed-compute"
-version = "0.1.0"
+version = "0.2.0"
 description = "A distributed computing engine built from scratch in Python: master-worker architecture, a custom TCP RPC protocol, MapReduce, and pluggable execution backends."
 readme = "README.md"
 requires-python = ">=3.10"
